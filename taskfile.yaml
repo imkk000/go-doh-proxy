@@ -1,0 +1,7 @@
+---
+version: 3
+tasks:
+  gen_cert: >-
+    docker run -it --rm -v ./cert:/etc/letsencrypt
+    docker.io/certbot/certbot certonly
+    --manual --preferred-challenges dns -d {{.DOMAIN}}
