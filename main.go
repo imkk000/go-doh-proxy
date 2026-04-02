@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
 	"github.com/miekg/dns"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
@@ -78,18 +80,55 @@ func main() {
 		os.Exit(1)
 		return
 	}
-	client = &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dial.Dial(network, addr)
-			},
-			ForceAttemptHTTP2: true,
+	dialer := dial.(proxy.ContextDialer)
+	httpTransport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
 		},
 	}
+	http2.ConfigureTransport(httpTransport)
+	client = &http.Client{
+		Transport: httpTransport,
+	}
 
-	e.Use(middleware.Recover())
 	if enabledLog {
-		e.Use(middleware.RequestLogger())
+		e.Use(middleware.Recover())
+		e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+			HandleError:      true,
+			LogLatency:       true,
+			LogProtocol:      true,
+			LogMethod:        true,
+			LogURI:           true,
+			LogRoutePath:     true,
+			LogStatus:        true,
+			LogContentLength: true,
+			LogResponseSize:  true,
+			LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
+				logger := c.Logger()
+				if v.Error == nil {
+					logger.LogAttrs(context.Background(), slog.LevelInfo, "request",
+						slog.String("method", v.Method),
+						slog.String("uri", v.URI),
+						slog.Int("status", v.Status),
+						slog.Duration("latency", v.Latency),
+						slog.String("bytes_in", v.ContentLength),
+						slog.Int64("bytes_out", v.ResponseSize),
+					)
+					return nil
+				}
+
+				logger.LogAttrs(context.Background(), slog.LevelError, "request error",
+					slog.String("method", v.Method),
+					slog.String("uri", v.URI),
+					slog.Int("status", v.Status),
+					slog.Duration("latency", v.Latency),
+					slog.String("bytes_in", v.ContentLength),
+					slog.Int64("bytes_out", v.ResponseSize),
+					slog.String("error", v.Error.Error()),
+				)
+				return nil
+			},
+		}))
 	}
 
 	g := e.Group("dns-query")
@@ -105,14 +144,14 @@ func main() {
 func query(c *echo.Context, rawMsg []byte) error {
 	msg := new(dns.Msg)
 	if err := msg.Unpack(rawMsg); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid query message").Wrap(err)
+		return newError(c, msg, err, "invalid query message")
 	}
 
 	// get cache
 	if msg, hit := getCache(msg); hit {
 		respBody, err := msg.Pack()
 		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "hit cache").Wrap(err)
+			return newError(c, msg, err, "hit cache")
 		}
 		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 	}
@@ -122,49 +161,57 @@ func query(c *echo.Context, rawMsg []byte) error {
 		if msg, isBlock := answerBlocklist(msg); isBlock {
 			respBody, err := msg.Pack()
 			if err != nil {
-				return echo.NewHTTPError(http.StatusInternalServerError, "block domain").Wrap(err)
+				return newError(c, msg, err, "block domain")
 			}
 			return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 		}
 	}
 
 	// query into server
-	req, err := http.NewRequest(http.MethodPost, dnsServer, bytes.NewReader(rawMsg))
+	req, err := http.NewRequestWithContext(c.Request().Context(), http.MethodPost, dnsServer, bytes.NewReader(rawMsg))
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "new http request").Wrap(err)
+		return newError(c, msg, err, "new http request")
 	}
+	req.ContentLength = int64(len(rawMsg))
 	req.Header.Set(echo.HeaderContentType, MIMEApplicationDNSMessage)
 	req.Header.Set(echo.HeaderAccept, MIMEApplicationDNSMessage)
 	httpResp, err := client.Do(req)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "do request").Wrap(err)
+		return newError(c, msg, err, "do request")
 	}
 	defer httpResp.Body.Close()
 
 	// parse response body
-	rawMsg, err = io.ReadAll(httpResp.Body)
+	respRawMsg, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "read response message").Wrap(err)
-	}
-	msg = new(dns.Msg)
-	if err := msg.Unpack(rawMsg); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "parse dns message").Wrap(err)
+		return newError(c, msg, err, "read response message")
 	}
 
-	// cache dns RR header
-	dnsCacheMutex.Lock()
-	for _, a := range msg.Answer {
-		key := a.Header().Name + dns.Type(a.Header().Rrtype).String()
-		dnsCache[key] = DNSCacheRR{
-			RR:     dns.Copy(a.Header()),
-			Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respRawMsg); err != nil {
+		return newError(c, msg, err, "parse dns message")
+	}
+
+	if len(respMsg.Answer) > 0 {
+		// cache dns RR header
+		dnsCacheMutex.Lock()
+		defer dnsCacheMutex.Unlock()
+		for _, a := range respMsg.Answer {
+			if a.Header() == nil {
+				continue
+			}
+
+			key := a.Header().Name + dns.Type(a.Header().Rrtype).String()
+			dnsCache[key] = DNSCacheRR{
+				RR:     dns.Copy(a.Header()),
+				Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
+			}
 		}
 	}
-	dnsCacheMutex.Unlock()
 
-	respBody, err := msg.Pack()
+	respBody, err := respMsg.Pack()
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "pack dns message").Wrap(err)
+		return newError(c, msg, err, "pack dns message")
 	}
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 }
@@ -172,11 +219,11 @@ func query(c *echo.Context, rawMsg []byte) error {
 func echoPOST(c *echo.Context) error {
 	contentType := c.Request().Header.Get(echo.HeaderContentType)
 	if contentType != MIMEApplicationDNSMessage {
-		return echo.NewHTTPError(http.StatusBadRequest, "query message not found")
+		return newError(c, nil, nil, "query message not found")
 	}
 	rawMsg, err := io.ReadAll(c.Request().Body)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "query message not found")
+		return newError(c, nil, nil, "query message not found")
 	}
 
 	return query(c, rawMsg)
@@ -185,14 +232,30 @@ func echoPOST(c *echo.Context) error {
 func echoGET(c *echo.Context) error {
 	domainName := c.QueryParam("dns")
 	if len(domainName) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "query message not found")
+		return newError(c, nil, nil, "query message not found")
 	}
 	rawMsg, err := base64.RawStdEncoding.DecodeString(domainName)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid query message").Wrap(err)
+		return newError(c, nil, nil, "query message not found")
 	}
 
 	return query(c, rawMsg)
+}
+
+func newError(c *echo.Context, msg *dns.Msg, err error, message string) error {
+	var respBody []byte
+	if msg != nil {
+		newMsg := new(dns.Msg)
+		newMsg.SetRcode(msg, dns.RcodeServerFailure)
+		respBody, _ = newMsg.Pack()
+		c.Logger().ErrorContext(
+			c.Request().Context(),
+			message,
+			"query", msg.Question,
+			"error", err,
+		)
+	}
+	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 }
 
 func getCache(msg *dns.Msg) (*dns.Msg, bool) {
@@ -209,6 +272,9 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 		}
 		ttl := time.Until(cache.Expiry).Seconds()
 		if ttl < 0 {
+			continue
+		}
+		if cache.RR == nil {
 			continue
 		}
 		rr := dns.Copy(cache.RR)
