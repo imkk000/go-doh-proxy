@@ -24,7 +24,8 @@ go run . \
   --key=privkey1.pem \
   --proxy=127.0.0.1:9050 \
   --dns=https://dns.quad9.net/dns-query \
-  --blocklist=blocklist.txt
+  --blocklist=blocklist.txt \
+  --log
 ```
 
 ## Options
@@ -37,6 +38,7 @@ go run . \
 | `--proxy`     | SOCKS5 proxy                                       |
 | `--dns`       | Upstream DoH server                                |
 | `--blocklist` | Blocklist file, one domain per line (suffix match) |
+| `--log`       | Enable request log                                 |
 
 ## Notes
 
