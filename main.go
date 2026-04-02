@@ -131,6 +131,9 @@ func main() {
 		}))
 	}
 
+	// clear dns cache
+	go evictDNSCache()
+
 	g := e.Group("dns-query")
 	g.POST("", echoPOST)
 	g.GET("", echoGET)
@@ -203,18 +206,14 @@ func query(c *echo.Context, rawMsg []byte) error {
 	if len(respMsg.Answer) > 0 {
 		// cache dns RR header
 		dnsCacheMutex.Lock()
-		defer dnsCacheMutex.Unlock()
 		for _, a := range respMsg.Answer {
-			if a.Header() == nil {
-				continue
-			}
-
 			key := a.Header().Name + dns.Type(a.Header().Rrtype).String()
 			dnsCache[key] = DNSCacheRR{
-				RR:     dns.Copy(a.Header()),
+				RR:     dns.Copy(a),
 				Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
 			}
 		}
+		dnsCacheMutex.Unlock()
 	}
 
 	respBody, err := respMsg.Pack()
@@ -266,6 +265,27 @@ func newError(c *echo.Context, msg *dns.Msg, err error, message string) error {
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 }
 
+func evictDNSCache() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	cleanFn := func() {
+		dnsCacheMutex.Lock()
+		defer dnsCacheMutex.Unlock()
+
+		for key, rr := range dnsCache {
+			ttl := time.Until(rr.Expiry).Seconds()
+			if ttl <= 0 {
+				delete(dnsCache, key)
+			}
+		}
+	}
+
+	for range ticker.C {
+		cleanFn()
+	}
+}
+
 func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 	newMsg := new(dns.Msg)
 	newMsg.SetReply(msg)
@@ -279,14 +299,14 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 			continue
 		}
 		ttl := time.Until(cache.Expiry).Seconds()
-		if ttl < 0 {
-			continue
-		}
-		if cache.RR == nil {
+		if ttl <= 0 {
 			continue
 		}
 		rr := dns.Copy(cache.RR)
 		rr.Header().Ttl = uint32(ttl)
+		if ttl == 0 {
+			rr.Header().Ttl = 1
+		}
 
 		newMsg.Answer = append(newMsg.Answer, rr)
 	}
