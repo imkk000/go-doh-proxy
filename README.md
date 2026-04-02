@@ -42,5 +42,6 @@ go run . \
 
 ## Notes
 
+- Allow only type: `[A, CNAME]`
 - Blocked domains return `0.0.0.0` (type A)
 - TCP mode: use `proxychains` as alternative to torsocks

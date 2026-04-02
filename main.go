@@ -147,6 +147,14 @@ func query(c *echo.Context, rawMsg []byte) error {
 		return newError(c, msg, err, "invalid query message")
 	}
 
+	// allow only type: A and CNAME
+	if len(msg.Question) > 0 && (msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeCNAME) {
+		newMsg := new(dns.Msg)
+		newMsg.SetReply(msg)
+		respBody, _ := newMsg.Pack()
+		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+	}
+
 	// get cache
 	if msg, hit := getCache(msg); hit {
 		respBody, err := msg.Pack()
