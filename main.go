@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,9 +28,13 @@ const MIMEApplicationDNSMessage = "application/dns-message"
 var (
 	blocklistFile     string
 	certFile, keyFile string
-	addr, dnsServer   string
-	proxyServer       string
+	addr, proxyServer string
+	dnsServers        []string
 	enabledLog        bool
+	defaultDNSServers = []string{
+		"https://dns.quad9.net/dns-query",
+		"https://security.cloudflare-dns.com/dns-query",
+	}
 )
 
 var (
@@ -54,16 +59,25 @@ func main() {
 	flag.StringVar(&certFile, "cert", "", "set cert.pem file")
 	flag.StringVar(&keyFile, "key", "", "set key.pem file")
 	flag.StringVar(&proxyServer, "proxy", "127.0.0.1:9050", "set proxy server to query dns")
-	flag.StringVar(&dnsServer, "dns", "https://dns.quad9.net/dns-query", "set doh dns server")
+	flag.Func("dns", "set doh dns server", func(s string) error {
+		if len(s) == 0 {
+			return errors.New("dns server cannot be empty")
+		}
+		dnsServers = append(dnsServers, s)
+		return nil
+	})
 	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
 	flag.BoolVar(&enabledLog, "log", false, "enable log")
 	flag.Parse()
 
 	e := echo.New()
-	if len(certFile) == 0 || len(dnsServer) == 0 {
+	if len(certFile) == 0 || len(keyFile) == 0 {
 		e.Logger.Error("empty keys file path", "error", "empty keys")
 		os.Exit(1)
 		return
+	}
+	if len(dnsServers) == 0 {
+		dnsServers = defaultDNSServers
 	}
 
 	if err := readBlocklist(blocklistFile); err != nil {
@@ -138,7 +152,7 @@ func main() {
 	g.POST("", echoPOST)
 	g.GET("", echoGET)
 
-	sc := echo.StartConfig{Address: addr}
+	sc := echo.StartConfig{Address: addr, HideBanner: true}
 	if err := sc.StartTLS(context.Background(), e, certFile, keyFile); err != nil {
 		e.Logger.Error("start server", "error", err)
 	}
@@ -178,22 +192,15 @@ func query(c *echo.Context, rawMsg []byte) error {
 		}
 	}
 
-	// query into server
-	req, err := http.NewRequestWithContext(c.Request().Context(), http.MethodPost, dnsServer, bytes.NewReader(rawMsg))
-	if err != nil {
-		return newError(c, msg, err, "new http request")
-	}
-	req.ContentLength = int64(len(rawMsg))
-	req.Header.Set(echo.HeaderContentType, MIMEApplicationDNSMessage)
-	req.Header.Set(echo.HeaderAccept, MIMEApplicationDNSMessage)
-	httpResp, err := client.Do(req)
+	// query from upstream servers
+	resp, err := doRequest(c.Request().Context(), rawMsg)
 	if err != nil {
 		return newError(c, msg, err, "do request")
 	}
-	defer httpResp.Body.Close()
+	defer resp.Body.Close()
 
 	// parse response body
-	respRawMsg, err := io.ReadAll(httpResp.Body)
+	respRawMsg, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return newError(c, msg, err, "read response message")
 	}
@@ -221,6 +228,25 @@ func query(c *echo.Context, rawMsg []byte) error {
 		return newError(c, msg, err, "pack dns message")
 	}
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+}
+
+func doRequest(ctx context.Context, rawMsg []byte) (*http.Response, error) {
+	for _, server := range dnsServers {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, server, bytes.NewReader(rawMsg))
+		if err != nil {
+			continue
+		}
+		req.ContentLength = int64(len(rawMsg))
+		req.Header.Set(echo.HeaderContentType, MIMEApplicationDNSMessage)
+		req.Header.Set(echo.HeaderAccept, MIMEApplicationDNSMessage)
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		return resp, nil
+	}
+
+	return nil, errors.New("all upstream servers failed")
 }
 
 func echoPOST(c *echo.Context) error {

@@ -24,6 +24,7 @@ go run . \
   --key=privkey1.pem \
   --proxy=127.0.0.1:9050 \
   --dns=https://dns.quad9.net/dns-query \
+  --dns=https://security.cloudflare-dns.com/dns-query \
   --blocklist=blocklist.txt \
   --log
 ```
@@ -36,7 +37,7 @@ go run . \
 | `--cert`      | TLS certificate                                    |
 | `--key`       | TLS private key                                    |
 | `--proxy`     | SOCKS5 proxy                                       |
-| `--dns`       | Upstream DoH server                                |
+| `--dns`       | Upstream DoH server (support multiple dns)         |
 | `--blocklist` | Blocklist file, one domain per line (suffix match) |
 | `--log`       | Enable request log                                 |
 
