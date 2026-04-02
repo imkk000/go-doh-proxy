@@ -1,39 +1,44 @@
 # Play DOH
 
-## Why?
-
-I try to implement follow doh [rfc8484](https://datatracker.ietf.org/doc/html/rfc8484).
-I want to run doh over tor with my custom doh server.
+DNS-over-HTTPS (DoH) proxy server over Tor. Implements [RFC 8484](https://datatracker.ietf.org/doc/html/rfc8484).
 
 ## Design
 
 ```
-client -> local doh server -> torsocks -> dial tcp dns server -> answer
+client → local doh server → torsocks → upstream doh → answer
 ```
 
-## CLI
+## Usage
 
 ```bash
-# generate letencrypt with certbot manually
-task gen_cert DOMAIN=<public domain>
+# Build
+task build
 
-# server hostname (if build change to :9553)
---addr=127.0.0.1:9553
+# Generate TLS cert
+task gen_cert DOMAIN=<your domain>
 
-# tls cert and key
---cert=fullchains1.pem
---key=privkey1.pem
-
-# exchange dns server
---dns=127.0.0.1:9059
-# for tor inside docker I use and link dns server in same network
---dns=onion_dns:9053
-
-# blocklist file and insert domain per line (e.g. www.google.com.)
---blocklist=blocklist.txt
+# Run
+go run . \
+  --addr=127.0.0.1:9553 \
+  --cert=fullchains1.pem \
+  --key=privkey1.pem \
+  --proxy=127.0.0.1:9050 \
+  --dns=https://dns.quad9.net/dns-query \
+  --blocklist=blocklist.txt
 ```
+
+## Options
+
+| Flag          | Description                                        |
+| ------------- | -------------------------------------------------- |
+| `--addr`      | Listen address                                     |
+| `--cert`      | TLS certificate                                    |
+| `--key`       | TLS private key                                    |
+| `--proxy`     | SOCKS5 proxy                                       |
+| `--dns`       | Upstream DoH server                                |
+| `--blocklist` | Blocklist file, one domain per line (suffix match) |
 
 ## Notes
 
-- Drop blacklist using `0.0.0.0` instead of `127.0.0.1`
-- Can use `proxychains` to query dns when set dns client to **TCP**
+- Blocked domains return `0.0.0.0` (type A)
+- TCP mode: use `proxychains` as alternative to torsocks

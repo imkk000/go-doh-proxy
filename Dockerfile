@@ -11,5 +11,7 @@ FROM docker.io/alpine:3.23
 
 WORKDIR /opt/doh
 COPY --from=builder /builder/main server
+RUN chown nobody:nobody server
 
+USER nobody
 ENTRYPOINT ["/opt/doh/server"]

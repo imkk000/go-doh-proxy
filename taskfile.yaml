@@ -1,6 +1,7 @@
 ---
 version: 3
 tasks:
+  build: docker build -t doh-server .
   gen_cert: >-
     docker run -it --rm -v ./cert:/etc/letsencrypt
     docker.io/certbot/certbot certonly

@@ -1,4 +1,3 @@
 cert
 *.pem
 blocklist.txt
-docker-compose.yaml

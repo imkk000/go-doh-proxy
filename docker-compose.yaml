@@ -1,0 +1,25 @@
+---
+services:
+  local-doh-server:
+    image: localhost/doh-server:latest
+    container_name: local-doh-server
+    user: 1000:1000
+    ports:
+      - 127.0.0.1:9553:9553
+    volumes:
+      - ./cert/fullchain1.pem:/opt/doh/cert/fullchain1.pem:ro
+      - ./cert/privkey1.pem:/opt/doh/cert/privkey1.pem:ro
+      - ./blocklist.txt:/opt/doh/blocklist.txt:ro
+    command:
+      [
+        "--addr=:9553",
+        "--cert=cert/fullchain1.pem",
+        "--key=cert/privkey1.pem",
+        "--proxy=onion_circuit:9050",
+        "--blocklist=blocklist.txt",
+        "--log",
+      ]
+networks:
+  default:
+    name: internal
+    external: true
