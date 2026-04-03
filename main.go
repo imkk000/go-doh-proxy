@@ -33,6 +33,7 @@ var (
 	enabledLog        bool
 	defaultDNSServers = []string{
 		"https://dns.quad9.net/dns-query",
+		"https://all.dns.mullvad.net/dns-query",
 		"https://security.cloudflare-dns.com/dns-query",
 	}
 )
