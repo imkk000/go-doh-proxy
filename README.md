@@ -20,12 +20,14 @@ task gen_cert DOMAIN=<your domain>
 # Run
 go run . \
   --addr=127.0.0.1:9553 \
+  --udp=127.0.0.1:9053 \
   --cert=fullchains1.pem \
   --key=privkey1.pem \
   --proxy=127.0.0.1:9050 \
   --dns=https://dns.quad9.net/dns-query \
   --dns=https://security.cloudflare-dns.com/dns-query \
   --blocklist=blocklist.txt \
+  --http \
   --log
 ```
 
@@ -33,7 +35,9 @@ go run . \
 
 | Flag          | Description                                        |
 | ------------- | -------------------------------------------------- |
+| `--http`      | Run server with http instead of https              |
 | `--addr`      | Listen address                                     |
+| `--udp`       | Listen udp address                                 |
 | `--cert`      | TLS certificate                                    |
 | `--key`       | TLS private key                                    |
 | `--proxy`     | SOCKS5 proxy                                       |

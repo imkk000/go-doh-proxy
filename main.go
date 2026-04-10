@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -26,9 +28,11 @@ import (
 const MIMEApplicationDNSMessage = "application/dns-message"
 
 var (
+	httpMode          bool
 	blocklistFile     string
 	certFile, keyFile string
 	addr, proxyServer string
+	udpAddr           string
 	dnsServers        []string
 	enabledLog        bool
 	defaultDNSServers = []string{
@@ -56,7 +60,9 @@ type DNSCacheRR struct {
 }
 
 func main() {
+	flag.BoolVar(&httpMode, "http", false, "set http mode")
 	flag.StringVar(&addr, "addr", "127.0.0.1:9553", "set address")
+	flag.StringVar(&udpAddr, "udp", "", "set udp address")
 	flag.StringVar(&certFile, "cert", "", "set cert.pem file")
 	flag.StringVar(&keyFile, "key", "", "set key.pem file")
 	flag.StringVar(&proxyServer, "proxy", "127.0.0.1:9050", "set proxy server to query dns")
@@ -72,7 +78,7 @@ func main() {
 	flag.Parse()
 
 	e := echo.New()
-	if len(certFile) == 0 || len(keyFile) == 0 {
+	if !httpMode && (len(certFile) == 0 || len(keyFile) == 0) {
 		e.Logger.Error("empty keys file path", "error", "empty keys")
 		os.Exit(1)
 		return
@@ -87,6 +93,34 @@ func main() {
 		return
 	}
 	hasBlocklist = len(blockList) > 0
+
+	// enable udp server if enabled
+	if len(udpAddr) > 0 {
+		addrPort, err := netip.ParseAddrPort(udpAddr)
+		if err != nil {
+			e.Logger.Error("parse udp addr port", "error", err)
+			os.Exit(1)
+			return
+		}
+
+		addr := net.UDPAddrFromAddrPort(addrPort)
+		conn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			e.Logger.Error("listen udp server", "error", err)
+			os.Exit(1)
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 512)
+		for {
+			n, remoteAddr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			go handleUDP(conn, remoteAddr, buf[:n])
+		}
+	}
 
 	// setup http client
 	dial, err := proxy.SOCKS5("tcp", proxyServer, nil, proxy.Direct)
@@ -153,11 +187,25 @@ func main() {
 	g.POST("", echoPOST)
 	g.GET("", echoGET)
 
-	sc := echo.StartConfig{Address: addr, HideBanner: true}
-	if err := sc.StartTLS(context.Background(), e, certFile, keyFile); err != nil {
+	sc := echo.StartConfig{
+		Address:    addr,
+		HideBanner: true,
+		HidePort:   true,
+	}
+
+	startFn := sc.StartTLS
+	if httpMode {
+		// wrap start tls
+		startFn = func(ctx context.Context, h http.Handler, _, _ any) error {
+			return sc.Start(ctx, h)
+		}
+	}
+	if err := startFn(context.Background(), e, certFile, keyFile); err != nil {
 		e.Logger.Error("start server", "error", err)
 	}
 }
+
+type StartFn = func(context.Context, http.Handler, string, string) error
 
 func query(c *echo.Context, rawMsg []byte) error {
 	msg := new(dns.Msg)
@@ -357,7 +405,7 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 					Class:  dns.ClassINET,
 					Ttl:    300,
 				},
-				A: blockIP,
+				A: net.IPv4zero,
 			})
 
 			return newMsg, true
@@ -407,4 +455,17 @@ func readBlocklist(blocklistFile string) error {
 	}
 
 	return nil
+}
+
+func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
+	req, _ := http.NewRequest("POST", "/dns-query", bytes.NewReader(rawMsg))
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	c := echo.NewContext(req, rec)
+
+	if err := query(c, rawMsg); err != nil {
+		return
+	}
+
+	conn.WriteToUDP(rec.Body.Bytes(), addr)
 }
