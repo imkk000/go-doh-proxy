@@ -2,6 +2,7 @@
 version: 3
 tasks:
   build: docker build -t doh-server .
+  reload_config: docker kill --signal SIGHUP doh_server
   gen_cert: >-
     docker run -it --rm -v ./cert:/etc/letsencrypt
     docker.io/certbot/certbot certonly

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,10 +55,10 @@ var (
 )
 
 var (
-	hasBlocklist  bool
-	hasSkipList   bool
-	blockList     = NewTrie()
-	skipList      = NewTrie()
+	hasBlocklist  atomic.Bool
+	hasSkipList   atomic.Bool
+	blockList     atomic.Pointer[Trie]
+	skipList      atomic.Pointer[Trie]
 	clientConfigs = make([]ClientConfig, 0)
 )
 
@@ -143,6 +144,43 @@ func parseFlags() {
 	}
 }
 
+func reloadConfig() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP)
+
+	go func() {
+		for range sigs {
+			slog.Info("reloading configuration files")
+			if err := loadConfigs(); err != nil {
+				slog.Error("reloading configuration files", "err", err)
+			}
+		}
+	}()
+}
+
+func loadConfigs() error {
+	prevSkipList := skipList.Load()
+	skipListTrie, err := readConfigFile(skipListFile)
+	if err != nil {
+		return fmt.Errorf("read skip list: %w", err)
+	}
+	skipList.Store(&skipListTrie)
+	hasSkipList.Store(!skipList.Load().IsZero())
+
+	blockListTrie, err := readConfigFile(blocklistFile)
+	if err != nil {
+		// rollback skip list
+		skipList.Store(prevSkipList)
+		hasSkipList.Store(!skipList.Load().IsZero())
+
+		return fmt.Errorf("read blocklist: %w", err)
+	}
+	blockList.Store(&blockListTrie)
+	hasBlocklist.Store(!blockList.Load().IsZero())
+
+	return nil
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -154,19 +192,11 @@ func main() {
 		return
 	}
 
-	if err := readSkipList(skipListFile); err != nil {
-		slog.Error("read skip list", "error", err)
+	if err := loadConfigs(); err != nil {
+		slog.Error("load configuration file", "error", err)
 		os.Exit(1)
 		return
 	}
-	hasSkipList = !skipList.IsZero()
-
-	if err := readBlocklist(blocklistFile); err != nil {
-		slog.Error("read blocklist", "error", err)
-		os.Exit(1)
-		return
-	}
-	hasBlocklist = !blockList.IsZero()
 
 	// enable udp server if enabled
 	if len(udpAddr) > 0 {
@@ -230,6 +260,9 @@ func main() {
 		slog.Info("print client configs", "clients", clientConfigs)
 	}
 
+	// wait signal reload config (tailscale style)
+	go reloadConfig()
+
 	// clear dns cache
 	go evictDNSCache()
 
@@ -283,9 +316,9 @@ func query(c *echo.Context, rawMsg []byte) error {
 		slog.Info("query", "q", msg.Question)
 	}
 
-	if hasSkipList {
+	if hasSkipList.Load() {
 		for _, q := range msg.Question {
-			if skipList.Match(q.Name) {
+			if skipList.Load().Match(q.Name) {
 				rawBody, err := resolveSkipUDP(c.Request().Context(), rawMsg)
 				if err != nil {
 					return newError(c, msg, err, "skip domain")
@@ -313,7 +346,7 @@ func query(c *echo.Context, rawMsg []byte) error {
 	}
 
 	// skip if blocklist is empty
-	if hasBlocklist {
+	if hasBlocklist.Load() {
 		if msg, isBlock := answerBlocklist(msg); isBlock {
 			respBody, err := msg.Pack()
 			if err != nil {
@@ -503,7 +536,7 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 
 func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 	for _, q := range msg.Question {
-		if blockList.Match(q.Name) {
+		if blockList.Load().Match(q.Name) {
 			newMsg := new(dns.Msg)
 			newMsg.SetReply(msg)
 			newMsg.Answer = append(newMsg.Answer, &dns.A{
@@ -523,13 +556,14 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 	return msg, false
 }
 
-func readConfigFile(filename string, trieList *Trie) error {
+func readConfigFile(filename string) (Trie, error) {
+	trieList := NewTrie()
 	if len(filename) == 0 {
-		return nil
+		return trieList, nil
 	}
 	fs, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("open %s filename: %w", filename, err)
+		return trieList, fmt.Errorf("open %s filename: %w", filename, err)
 	}
 	defer fs.Close()
 
@@ -548,15 +582,7 @@ func readConfigFile(filename string, trieList *Trie) error {
 		trieList.Insert(line)
 	}
 
-	return nil
-}
-
-func readBlocklist(blocklistFile string) error {
-	return readConfigFile(blocklistFile, blockList)
-}
-
-func readSkipList(skipListFile string) error {
-	return readConfigFile(skipListFile, skipList)
+	return trieList, nil
 }
 
 func enableHTTPLog(e *echo.Echo) {
@@ -653,8 +679,8 @@ type Trie struct {
 	matched  bool
 }
 
-func NewTrie() *Trie {
-	return &Trie{children: map[string]*Trie{}}
+func NewTrie() Trie {
+	return Trie{children: map[string]*Trie{}}
 }
 
 func (t *Trie) IsZero() bool {
