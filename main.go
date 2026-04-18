@@ -32,16 +32,18 @@ import (
 )
 
 var (
-	noProxyServers    bool
-	httpMode          bool
-	blocklistFile     string
-	certFile, keyFile string
-	addr              string
-	udpAddr           string
-	dnsServers        []DNSConfig
-	proxyServers      []Config
-	enabledLog        bool
-	defaultDNSServers = []DNSConfig{
+	noProxyServers     bool
+	httpMode           bool
+	blocklistFile      string
+	skipListFile       string
+	certFile, keyFile  string
+	udpAddr            string
+	dnsServers         []DNSConfig
+	proxyServers       []Config
+	enabledLog         bool
+	addr               = "127.0.0.1:9553"
+	defaultDNSResolver = "host.docker.internal:53"
+	defaultDNSServers  = []DNSConfig{
 		{0, "https://dns.quad9.net/dns-query", TypeDefault},
 		{1, "https://all.dns.mullvad.net/dns-query", TypeDefault},
 		{2, "https://security.cloudflare-dns.com/dns-query", TypeDefault},
@@ -53,7 +55,9 @@ var (
 
 var (
 	hasBlocklist  bool
+	hasSkipList   bool
 	blockList     = NewTrie()
+	skipList      = NewTrie()
 	clientConfigs = make([]ClientConfig, 0)
 )
 
@@ -65,13 +69,15 @@ type DNSCacheRR struct {
 }
 
 func parseFlags() {
-	flag.BoolVar(&httpMode, "http", false, "set http mode")
-	flag.StringVar(&addr, "addr", "127.0.0.1:9553", "set address")
+	flag.BoolVar(&httpMode, "http", httpMode, "set http mode")
+	flag.StringVar(&addr, "addr", addr, "set address")
 	flag.StringVar(&udpAddr, "udp", "", "set udp address")
 	flag.StringVar(&certFile, "cert", "", "set cert.pem file")
 	flag.StringVar(&keyFile, "key", "", "set key.pem file")
+	flag.StringVar(&skipListFile, "skiplist", "", "set skip list file")
 	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
-	flag.BoolVar(&enabledLog, "log", false, "enable log")
+	flag.StringVar(&defaultDNSResolver, "default-resolver", defaultDNSResolver, "set default dns server")
+	flag.BoolVar(&enabledLog, "log", enabledLog, "enable log")
 	flag.Func("proxy", "set proxy servers to query dns using random routes", func(s string) error {
 		if noProxyServers {
 			return nil
@@ -138,6 +144,8 @@ func parseFlags() {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	parseFlags()
 
 	if !httpMode && (len(certFile) == 0 || len(keyFile) == 0) {
@@ -145,6 +153,13 @@ func main() {
 		os.Exit(1)
 		return
 	}
+
+	if err := readSkipList(skipListFile); err != nil {
+		slog.Error("read skip list", "error", err)
+		os.Exit(1)
+		return
+	}
+	hasSkipList = skipList.IsZero()
 
 	if err := readBlocklist(blocklistFile); err != nil {
 		slog.Error("read blocklist", "error", err)
@@ -180,6 +195,9 @@ func main() {
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					return dialer.DialContext(ctx, network, addr)
 				},
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 15 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
 			}
 			http2.ConfigureTransport(httpTransport)
 
@@ -187,6 +205,7 @@ func main() {
 				DNSConfigs: dnsConfigs,
 				Client: &http.Client{
 					Transport: httpTransport,
+					Timeout:   30 * time.Second,
 				},
 			}
 		}
@@ -205,9 +224,11 @@ func main() {
 		})
 	}
 
-	fmt.Println("proxy:", proxyServers)
-	fmt.Println("dns:", dnsServers)
-	fmt.Println("client:", clientConfigs)
+	if enabledLog {
+		slog.Info("print proxy servers", "servers", proxyServers)
+		slog.Info("print dns servers", "servers", dnsServers)
+		slog.Info("print client configs", "clients", clientConfigs)
+	}
 
 	// clear dns cache
 	go evictDNSCache()
@@ -256,6 +277,22 @@ func query(c *echo.Context, rawMsg []byte) error {
 	msg := new(dns.Msg)
 	if err := msg.Unpack(rawMsg); err != nil {
 		return newError(c, msg, err, "invalid query message")
+	}
+
+	if enabledLog {
+		slog.Info("query", "q", msg.Question)
+	}
+
+	if hasSkipList {
+		for _, q := range msg.Question {
+			if skipList.Match(q.Name) {
+				rawBody, err := resolveSkipUDP(c.Request().Context(), rawMsg)
+				if err != nil {
+					return newError(c, msg, err, "skip domain")
+				}
+				return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, rawBody)
+			}
+		}
 	}
 
 	// allow only type: A and CNAME
@@ -320,6 +357,34 @@ func query(c *echo.Context, rawMsg []byte) error {
 		return newError(c, msg, err, "pack dns message")
 	}
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+}
+
+func resolveSkipUDP(ctx context.Context, rawMsg []byte) ([]byte, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", defaultDNSResolver)
+	if err != nil {
+		return nil, fmt.Errorf("dial udp: %w", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	n, err := conn.Write(rawMsg)
+	if err != nil || n == 0 {
+		if n == 0 {
+			err = io.EOF
+		}
+		return nil, fmt.Errorf("write msg udp: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err = conn.Read(buf)
+	if err != nil || n == 0 {
+		if n == 0 {
+			err = io.EOF
+		}
+		return nil, fmt.Errorf("read msg udp: %w", err)
+	}
+	return buf[:n], nil
 }
 
 func doRequest(ctx context.Context, rawMsg []byte) (*http.Response, error) {
@@ -458,13 +523,13 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 	return msg, false
 }
 
-func readBlocklist(blocklistFile string) error {
-	if len(blocklistFile) == 0 {
+func readConfigFile(filename string, trieList *Trie) error {
+	if len(filename) == 0 {
 		return nil
 	}
-	fs, err := os.Open(blocklistFile)
+	fs, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("open blocklist file: %w", err)
+		return fmt.Errorf("open %s filename: %w", filename, err)
 	}
 	defer fs.Close()
 
@@ -480,10 +545,18 @@ func readBlocklist(blocklistFile string) error {
 		if !strings.HasSuffix(line, ".") {
 			line += "."
 		}
-		blockList.Insert(line)
+		trieList.Insert(line)
 	}
 
 	return nil
+}
+
+func readBlocklist(blocklistFile string) error {
+	return readConfigFile(blocklistFile, blockList)
+}
+
+func readSkipList(skipListFile string) error {
+	return readConfigFile(skipListFile, skipList)
 }
 
 func enableHTTPLog(e *echo.Echo) {

@@ -52,6 +52,8 @@ go run . \
 | `--key`       |                                     | TLS private key file (required unless `--http`)                                              |
 | `--proxy`     | `127.0.0.1:9050`                    | SOCKS5 proxy; use `off` to disable; prefix `tor;` for Tor-only routing; supports multiple    |
 | `--dns`       | quad9, mullvad, cloudflare          | Upstream DoH server in `<index>;<url>` format; lower index = higher priority; supports multiple |
+| `--skiplist`          |                             | Skip list file, one domain per line; matched domains bypass DoH and resolve via UDP          |
+| `--default-resolver` | `host.docker.internal:53`   | UDP resolver used for skip list domains                                                      |
 | `--blocklist` |                                     | Blocklist file, one domain per line (suffix match)                                           |
 | `--log`       | `false`                             | Enable request logging                                                                       |
 
@@ -64,4 +66,5 @@ go run . \
 - Multiple `--dns` servers are tried in index order; first success wins
 - `tor;` proxy prefix: that proxy only routes to `.onion` DNS endpoints
 - DNS servers with `.onion` hosts are skipped when proxies are disabled (`--proxy=off`)
+- Skip list domains bypass DoH entirely and are resolved via plain UDP to `--default-resolver`
 - Use `proxychains` as an alternative to a SOCKS5 proxy
