@@ -37,6 +37,7 @@ go run . \
   --dns=0;https://dns.quad9.net/dns-query \
   --dns=1;https://security.cloudflare-dns.com/dns-query \
   --blocklist=blocklist.txt \
+  --default-resolver=127.0.0.1:53 \
   --http \
   --log
 ```
@@ -59,6 +60,7 @@ go run . \
 
 ## Notes
 
+- Send `SIGHUP` to reload `--skiplist` and `--blocklist` files without restarting
 - Only DNS query types `A` and `CNAME` are resolved; others return an empty reply
 - Blocked domains return `0.0.0.0` (type A, TTL 300)
 - DNS responses are cached in-memory by TTL; cache is evicted every 10 minutes
