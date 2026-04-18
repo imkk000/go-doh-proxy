@@ -159,14 +159,14 @@ func main() {
 		os.Exit(1)
 		return
 	}
-	hasSkipList = skipList.IsZero()
+	hasSkipList = !skipList.IsZero()
 
 	if err := readBlocklist(blocklistFile); err != nil {
 		slog.Error("read blocklist", "error", err)
 		os.Exit(1)
 		return
 	}
-	hasBlocklist = blockList.IsZero()
+	hasBlocklist = !blockList.IsZero()
 
 	// enable udp server if enabled
 	if len(udpAddr) > 0 {
@@ -633,7 +633,16 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
 	c := echo.NewContext(req, rec)
 
 	if err := query(c, rawMsg); err != nil {
+		slog.Error("query", "err", err)
 		return
+	}
+
+	if enabledLog {
+		msg := new(dns.Msg)
+		err := msg.Unpack(rec.Body.Bytes())
+		if enabledLog && err == nil {
+			slog.Info("unpack", "q", msg.Question, "a", msg.Answer)
+		}
 	}
 
 	conn.WriteToUDP(rec.Body.Bytes(), addr)
