@@ -9,13 +9,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
+	"os/signal"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -25,184 +31,223 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const MIMEApplicationDNSMessage = "application/dns-message"
-
 var (
+	noProxyServers    bool
 	httpMode          bool
 	blocklistFile     string
 	certFile, keyFile string
-	addr, proxyServer string
+	addr              string
 	udpAddr           string
-	dnsServers        []string
+	dnsServers        []DNSConfig
+	proxyServers      []Config
 	enabledLog        bool
-	defaultDNSServers = []string{
-		"https://dns.quad9.net/dns-query",
-		"https://all.dns.mullvad.net/dns-query",
-		"https://security.cloudflare-dns.com/dns-query",
+	defaultDNSServers = []DNSConfig{
+		{0, "https://dns.quad9.net/dns-query", TypeDefault},
+		{1, "https://all.dns.mullvad.net/dns-query", TypeDefault},
+		{2, "https://security.cloudflare-dns.com/dns-query", TypeDefault},
+	}
+	defaultProxyServers = []Config{
+		{"127.0.0.1:9050", TypeDefault},
 	}
 )
 
 var (
-	hasBlocklist bool
-	blockList    = make(map[string]struct{})
-	blockIP      = net.ParseIP("0.0.0.0")
-	client       = http.DefaultClient
+	hasBlocklist  bool
+	blockList     = NewTrie()
+	clientConfigs = make([]ClientConfig, 0)
 )
 
-var (
-	dnsCache      = make(map[string]DNSCacheRR)
-	dnsCacheMutex = new(sync.RWMutex)
-)
+var dnsCache = new(sync.Map)
 
 type DNSCacheRR struct {
 	RR     dns.RR
 	Expiry time.Time
 }
 
-func main() {
+func parseFlags() {
 	flag.BoolVar(&httpMode, "http", false, "set http mode")
 	flag.StringVar(&addr, "addr", "127.0.0.1:9553", "set address")
 	flag.StringVar(&udpAddr, "udp", "", "set udp address")
 	flag.StringVar(&certFile, "cert", "", "set cert.pem file")
 	flag.StringVar(&keyFile, "key", "", "set key.pem file")
-	flag.StringVar(&proxyServer, "proxy", "127.0.0.1:9050", "set proxy server to query dns")
+	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
+	flag.BoolVar(&enabledLog, "log", false, "enable log")
+	flag.Func("proxy", "set proxy servers to query dns using random routes", func(s string) error {
+		if noProxyServers {
+			return nil
+		}
+		if len(s) == 0 {
+			return errors.New("proxy server cannot be empty")
+		}
+		if s == "off" {
+			noProxyServers = true
+			proxyServers = make([]Config, 0)
+			return nil
+		}
+
+		var configType Type
+		if strings.HasPrefix(s, TorPrefix) {
+			configType = TypeTor
+			s = strings.TrimPrefix(s, TorPrefix)
+		}
+		proxyServers = append(proxyServers, Config{s, configType})
+
+		return nil
+	})
 	flag.Func("dns", "set doh dns server", func(s string) error {
 		if len(s) == 0 {
 			return errors.New("dns server cannot be empty")
 		}
-		dnsServers = append(dnsServers, s)
+
+		ss := strings.Split(s, ";")
+		if len(ss) < 2 {
+			return fmt.Errorf("invalid format: %q", s)
+		}
+		idx, err := strconv.Atoi(ss[0])
+		if err != nil {
+			return fmt.Errorf("cannot parse index: %q %w", ss[0], err)
+		}
+		u, err := url.Parse(ss[1])
+		if err != nil {
+			return fmt.Errorf("cannot parse url: %q %w", ss[1], err)
+		}
+
+		var configType Type
+		if strings.HasSuffix(u.Host, OnionSuffix) {
+			configType = TypeTor
+		}
+		dnsServers = append(dnsServers, DNSConfig{
+			ID:   idx,
+			Host: u.String(),
+			Type: configType,
+		})
+
 		return nil
 	})
-	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
-	flag.BoolVar(&enabledLog, "log", false, "enable log")
 	flag.Parse()
 
-	e := echo.New()
-	if !httpMode && (len(certFile) == 0 || len(keyFile) == 0) {
-		e.Logger.Error("empty keys file path", "error", "empty keys")
-		os.Exit(1)
-		return
-	}
 	if len(dnsServers) == 0 {
 		dnsServers = defaultDNSServers
 	}
+	slices.SortFunc(dnsServers, func(a, b DNSConfig) int {
+		return a.ID - b.ID
+	})
+	if !noProxyServers && len(proxyServers) == 0 {
+		proxyServers = defaultProxyServers
+	}
+}
 
-	if err := readBlocklist(blocklistFile); err != nil {
-		e.Logger.Error("read blocklist", "error", err)
+func main() {
+	parseFlags()
+
+	if !httpMode && (len(certFile) == 0 || len(keyFile) == 0) {
+		slog.Error("empty keys file path", "error", "empty keys")
 		os.Exit(1)
 		return
 	}
-	hasBlocklist = len(blockList) > 0
+
+	if err := readBlocklist(blocklistFile); err != nil {
+		slog.Error("read blocklist", "error", err)
+		os.Exit(1)
+		return
+	}
+	hasBlocklist = blockList.IsZero()
 
 	// enable udp server if enabled
 	if len(udpAddr) > 0 {
-		addrPort, err := netip.ParseAddrPort(udpAddr)
-		if err != nil {
-			e.Logger.Error("parse udp addr port", "error", err)
-			os.Exit(1)
-			return
-		}
-
-		addr := net.UDPAddrFromAddrPort(addrPort)
-		conn, err := net.ListenUDP("udp", addr)
-		if err != nil {
-			e.Logger.Error("listen udp server", "error", err)
-			os.Exit(1)
-			return
-		}
-		defer conn.Close()
-
-		buf := make([]byte, 512)
-		for {
-			n, remoteAddr, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-			go handleUDP(conn, remoteAddr, buf[:n])
-		}
+		go StartUDPServer()
 	}
 
 	// setup http client
-	dial, err := proxy.SOCKS5("tcp", proxyServer, nil, proxy.Direct)
-	if err != nil {
-		e.Logger.Error("connect to proxy server", "error", err)
-		os.Exit(1)
-		return
-	}
-	dialer := dial.(proxy.ContextDialer)
-	httpTransport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, addr)
-		},
-	}
-	http2.ConfigureTransport(httpTransport)
-	client = &http.Client{
-		Transport: httpTransport,
-	}
+	proxyLen := len(proxyServers)
+	clientConfigs = make([]ClientConfig, proxyLen)
+	if !noProxyServers {
+		for i, proxyServer := range proxyServers {
+			dial, err := proxy.SOCKS5("tcp", proxyServer.Host, nil, proxy.Direct)
+			if err != nil {
+				slog.Error("connect to proxy server", "error", err)
+				os.Exit(1)
+				return
+			}
+			dialer := dial.(proxy.ContextDialer)
+			dnsConfigs := slices.Clone(dnsServers)
+			if proxyServer.Type == TypeDefault {
+				dnsConfigs = slices.DeleteFunc(dnsConfigs, func(d DNSConfig) bool {
+					return d.Type == TypeTor
+				})
+			}
+			httpTransport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.DialContext(ctx, network, addr)
+				},
+			}
+			http2.ConfigureTransport(httpTransport)
 
-	if enabledLog {
-		e.Use(middleware.Recover())
-		e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
-			HandleError:      true,
-			LogLatency:       true,
-			LogProtocol:      true,
-			LogMethod:        true,
-			LogURI:           true,
-			LogRoutePath:     true,
-			LogStatus:        true,
-			LogContentLength: true,
-			LogResponseSize:  true,
-			LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
-				logger := c.Logger()
-				if v.Error == nil {
-					logger.LogAttrs(context.Background(), slog.LevelInfo, "request",
-						slog.String("method", v.Method),
-						slog.String("uri", v.URI),
-						slog.Int("status", v.Status),
-						slog.Duration("latency", v.Latency),
-						slog.String("bytes_in", v.ContentLength),
-						slog.Int64("bytes_out", v.ResponseSize),
-					)
-					return nil
-				}
-
-				logger.LogAttrs(context.Background(), slog.LevelError, "request error",
-					slog.String("method", v.Method),
-					slog.String("uri", v.URI),
-					slog.Int("status", v.Status),
-					slog.Duration("latency", v.Latency),
-					slog.String("bytes_in", v.ContentLength),
-					slog.Int64("bytes_out", v.ResponseSize),
-					slog.String("error", v.Error.Error()),
-				)
-				return nil
+			clientConfigs[i] = ClientConfig{
+				DNSConfigs: dnsConfigs,
+				Client: &http.Client{
+					Transport: httpTransport,
+				},
+			}
+		}
+	} else {
+		// remove dns over tor because no proxy
+		dnsServers = slices.DeleteFunc(dnsServers, func(d DNSConfig) bool {
+			return d.Type == TypeTor
+		})
+		httpTransport := http.DefaultTransport.(*http.Transport)
+		http2.ConfigureTransport(httpTransport)
+		clientConfigs = append(clientConfigs, ClientConfig{
+			DNSConfigs: dnsServers,
+			Client: &http.Client{
+				Transport: httpTransport,
 			},
-		}))
+		})
 	}
+
+	fmt.Println("proxy:", proxyServers)
+	fmt.Println("dns:", dnsServers)
+	fmt.Println("client:", clientConfigs)
 
 	// clear dns cache
 	go evictDNSCache()
 
-	g := e.Group("dns-query")
-	g.POST("", echoPOST)
-	g.GET("", echoGET)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	sc := echo.StartConfig{
-		Address:    addr,
-		HideBanner: true,
-		HidePort:   true,
-	}
+	// start http server
+	go func() {
+		e := echo.New()
 
-	startFn := sc.StartTLS
-	if httpMode {
-		// wrap start tls
-		startFn = func(ctx context.Context, h http.Handler, _, _ any) error {
-			return sc.Start(ctx, h)
+		if enabledLog {
+			enableHTTPLog(e)
 		}
-	}
-	if err := startFn(context.Background(), e, certFile, keyFile); err != nil {
-		e.Logger.Error("start server", "error", err)
-	}
+
+		g := e.Group("dns-query")
+		g.POST("", echoPOST)
+		g.GET("", echoGET)
+
+		sc := echo.StartConfig{
+			Address:    addr,
+			HideBanner: true,
+			HidePort:   true,
+		}
+
+		startFn := sc.StartTLS
+		if httpMode {
+			// wrap start tls
+			startFn = func(ctx context.Context, h http.Handler, _, _ any) error {
+				return sc.Start(ctx, h)
+			}
+		}
+		if err := startFn(ctx, e, certFile, keyFile); err != nil {
+			e.Logger.Error("start server", "error", err)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
 }
 
 type StartFn = func(context.Context, http.Handler, string, string) error
@@ -261,15 +306,13 @@ func query(c *echo.Context, rawMsg []byte) error {
 
 	if len(respMsg.Answer) > 0 {
 		// cache dns RR header
-		dnsCacheMutex.Lock()
 		for _, a := range respMsg.Answer {
 			key := a.Header().Name + dns.Type(a.Header().Rrtype).String()
-			dnsCache[key] = DNSCacheRR{
+			dnsCache.Store(key, DNSCacheRR{
 				RR:     dns.Copy(a),
 				Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
-			}
+			})
 		}
-		dnsCacheMutex.Unlock()
 	}
 
 	respBody, err := respMsg.Pack()
@@ -280,15 +323,18 @@ func query(c *echo.Context, rawMsg []byte) error {
 }
 
 func doRequest(ctx context.Context, rawMsg []byte) (*http.Response, error) {
-	for _, server := range dnsServers {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, server, bytes.NewReader(rawMsg))
+	idx := rand.IntN(len(clientConfigs))
+
+	for _, dnsConfig := range clientConfigs[idx].DNSConfigs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, dnsConfig.Host, bytes.NewReader(rawMsg))
 		if err != nil {
 			continue
 		}
 		req.ContentLength = int64(len(rawMsg))
 		req.Header.Set(echo.HeaderContentType, MIMEApplicationDNSMessage)
 		req.Header.Set(echo.HeaderAccept, MIMEApplicationDNSMessage)
-		resp, err := client.Do(req)
+
+		resp, err := clientConfigs[idx].Client.Do(req)
 		if err != nil {
 			continue
 		}
@@ -345,15 +391,14 @@ func evictDNSCache() {
 	defer ticker.Stop()
 
 	cleanFn := func() {
-		dnsCacheMutex.Lock()
-		defer dnsCacheMutex.Unlock()
-
-		for key, rr := range dnsCache {
+		dnsCache.Range(func(key any, val any) bool {
+			rr := val.(DNSCacheRR)
 			ttl := time.Until(rr.Expiry).Seconds()
 			if ttl <= 0 {
-				delete(dnsCache, key)
+				dnsCache.Delete(key)
 			}
-		}
+			return true
+		})
 	}
 
 	for range ticker.C {
@@ -367,12 +412,11 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 
 	for _, q := range msg.Question {
 		key := q.Name + dns.Type(q.Qtype).String()
-		dnsCacheMutex.RLock()
-		cache, hit := dnsCache[key]
-		dnsCacheMutex.RUnlock()
+		val, hit := dnsCache.Load(key)
 		if !hit {
 			continue
 		}
+		cache := val.(DNSCacheRR)
 		ttl := time.Until(cache.Expiry).Seconds()
 		if ttl <= 0 {
 			continue
@@ -394,10 +438,9 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 
 func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 	for _, q := range msg.Question {
-		if isBlockDomain(q.Name) {
+		if blockList.Match(q.Name) {
 			newMsg := new(dns.Msg)
 			newMsg.SetReply(msg)
-			// TODO: remove A and use generate per qtype
 			newMsg.Answer = append(newMsg.Answer, &dns.A{
 				Hdr: dns.RR_Header{
 					Name:   q.Name,
@@ -413,20 +456,6 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 	}
 
 	return msg, false
-}
-
-func isBlockDomain(name string) bool {
-	_, found := blockList[name]
-	if found {
-		return true
-	}
-	for blockName := range blockList {
-		if strings.HasSuffix(name, blockName) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func readBlocklist(blocklistFile string) error {
@@ -451,10 +480,77 @@ func readBlocklist(blocklistFile string) error {
 		if !strings.HasSuffix(line, ".") {
 			line += "."
 		}
-		blockList[line] = struct{}{}
+		blockList.Insert(line)
 	}
 
 	return nil
+}
+
+func enableHTTPLog(e *echo.Echo) {
+	e.Use(middleware.Recover())
+	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		HandleError:      true,
+		LogLatency:       true,
+		LogProtocol:      true,
+		LogMethod:        true,
+		LogURI:           true,
+		LogRoutePath:     true,
+		LogStatus:        true,
+		LogContentLength: true,
+		LogResponseSize:  true,
+		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
+			logger := c.Logger()
+			if v.Error == nil {
+				logger.LogAttrs(context.Background(), slog.LevelInfo, "request",
+					slog.String("method", v.Method),
+					slog.String("uri", v.URI),
+					slog.Int("status", v.Status),
+					slog.Duration("latency", v.Latency),
+					slog.String("bytes_in", v.ContentLength),
+					slog.Int64("bytes_out", v.ResponseSize),
+				)
+				return nil
+			}
+
+			logger.LogAttrs(context.Background(), slog.LevelError, "request error",
+				slog.String("method", v.Method),
+				slog.String("uri", v.URI),
+				slog.Int("status", v.Status),
+				slog.Duration("latency", v.Latency),
+				slog.String("bytes_in", v.ContentLength),
+				slog.Int64("bytes_out", v.ResponseSize),
+				slog.String("error", v.Error.Error()),
+			)
+			return nil
+		},
+	}))
+}
+
+func StartUDPServer() {
+	addrPort, err := netip.ParseAddrPort(udpAddr)
+	if err != nil {
+		slog.Error("parse udp addr port", "error", err)
+		os.Exit(1)
+		return
+	}
+
+	addr := net.UDPAddrFromAddrPort(addrPort)
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		slog.Error("listen udp server", "error", err)
+		os.Exit(1)
+		return
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 512)
+	for {
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		go handleUDP(conn, remoteAddr, buf[:n])
+	}
 }
 
 func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
@@ -469,3 +565,74 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
 
 	conn.WriteToUDP(rec.Body.Bytes(), addr)
 }
+
+type Trie struct {
+	children map[string]*Trie
+	matched  bool
+}
+
+func NewTrie() *Trie {
+	return &Trie{children: map[string]*Trie{}}
+}
+
+func (t *Trie) IsZero() bool {
+	return len(t.children) == 0
+}
+
+func (t *Trie) Insert(domain string) {
+	parts := strings.Split(domain, ".")
+	node := t
+	for i := len(parts) - 1; i >= 0; i-- {
+		if node.children[parts[i]] == nil {
+			node.children[parts[i]] = &Trie{children: map[string]*Trie{}}
+		}
+		node = node.children[parts[i]]
+	}
+	node.matched = true
+}
+
+func (t *Trie) Match(domain string) bool {
+	parts := strings.Split(domain, ".")
+	node := t
+	for i := len(parts) - 1; i >= 0; i-- {
+		if node.matched {
+			return true
+		}
+		next, ok := node.children[parts[i]]
+		if !ok {
+			return false
+		}
+		node = next
+	}
+	return node.matched
+}
+
+type DNSConfig struct {
+	ID   int
+	Host string
+	Type Type
+}
+
+type Config struct {
+	Host string
+	Type Type
+}
+
+type ClientConfig struct {
+	Client     *http.Client
+	DNSConfigs []DNSConfig
+}
+
+type Type int
+
+const (
+	TypeDefault Type = iota
+	TypeTor
+)
+
+const (
+	TorPrefix   = "tor;"
+	OnionSuffix = ".onion"
+)
+
+const MIMEApplicationDNSMessage = "application/dns-message"
