@@ -328,8 +328,8 @@ func query(c *echo.Context, rawMsg []byte) error {
 		}
 	}
 
-	// allow only type: A and CNAME
-	if len(msg.Question) > 0 && (msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeCNAME) {
+	// allow only type: A, AAAA and CNAME
+	if len(msg.Question) > 0 && (msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA && msg.Question[0].Qtype != dns.TypeCNAME) {
 		newMsg := new(dns.Msg)
 		newMsg.SetReply(msg)
 		respBody, _ := newMsg.Pack()
@@ -545,7 +545,8 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 		if blockList.Load().Match(q.Name) {
 			newMsg := new(dns.Msg)
 			newMsg.SetReply(msg)
-			newMsg.Answer = append(newMsg.Answer, &dns.A{
+
+			var answer dns.RR = &dns.A{
 				Hdr: dns.RR_Header{
 					Name:   q.Name,
 					Rrtype: dns.TypeA,
@@ -553,7 +554,19 @@ func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
 					Ttl:    300,
 				},
 				A: net.IPv4zero,
-			})
+			}
+			if q.Qtype == dns.TypeAAAA {
+				answer = &dns.AAAA{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeAAAA,
+						Class:  dns.ClassINET,
+						Ttl:    300,
+					},
+					AAAA: net.IPv6zero,
+				}
+			}
+			newMsg.Answer = append(newMsg.Answer, answer)
 
 			return newMsg, true
 		}
