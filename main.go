@@ -451,6 +451,9 @@ func echoPOST(c *echo.Context) error {
 	if err != nil {
 		return newError(c, nil, nil, "query message not found")
 	}
+	if len(rawMsg) == 0 {
+		return newError(c, nil, nil, "query message not found")
+	}
 
 	return query(c, rawMsg)
 }
@@ -462,6 +465,9 @@ func echoGET(c *echo.Context) error {
 	}
 	rawMsg, err := base64.RawStdEncoding.DecodeString(domainName)
 	if err != nil {
+		return newError(c, nil, nil, "query message not found")
+	}
+	if len(rawMsg) == 0 {
 		return newError(c, nil, nil, "query message not found")
 	}
 
