@@ -38,6 +38,7 @@ go run . \
   --dns=1;https://security.cloudflare-dns.com/dns-query \
   --blocklist=blocklist.txt \
   --default-resolver=127.0.0.1:53 \
+  --ua=useragents.txt \
   --http \
   --log
 ```
