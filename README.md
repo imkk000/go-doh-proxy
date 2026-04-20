@@ -61,8 +61,8 @@ go run . \
 ## Notes
 
 - Send `SIGHUP` to reload `--skiplist` and `--blocklist` files without restarting
-- Only DNS query types `A` and `CNAME` are resolved; others return an empty reply
-- Blocked domains return `0.0.0.0` (type A, TTL 300)
+- Only DNS query types `A`, `AAAA`, and `CNAME` are resolved; others return an empty reply
+- Blocked domains return `0.0.0.0` for type A or `::` for type AAAA (TTL 300)
 - DNS responses are cached in-memory by TTL; cache is evicted every 10 minutes
 - Multiple `--proxy` servers are selected randomly per request
 - Multiple `--dns` servers are tried in index order; first success wins
