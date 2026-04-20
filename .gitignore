@@ -2,3 +2,5 @@ cert
 *.pem
 blocklist.txt
 skiplist.txt
+useragent.txt
+doh-server

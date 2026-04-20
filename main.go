@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -30,6 +31,7 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -39,12 +41,27 @@ var (
 	skipListFile       string
 	certFile, keyFile  string
 	udpAddr            string
+	userAgentFile      string
 	dnsServers         []DNSConfig
 	proxyServers       []Config
 	enabledLog         bool
 	addr               = "127.0.0.1:9553"
 	defaultDNSResolver = "host.docker.internal:53"
-	defaultDNSServers  = []DNSConfig{
+	defaultUserAgent   = []string{
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.3",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.10 Safari/605.1.1",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.3",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 OPR/117.0.0.",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.3",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Trailer/93.3.8652.5",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.1958",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.3",
+	}
+	defaultDNSServers = []DNSConfig{
 		{0, "https://dns.quad9.net/dns-query", TypeDefault},
 		{1, "https://all.dns.mullvad.net/dns-query", TypeDefault},
 		{2, "https://security.cloudflare-dns.com/dns-query", TypeDefault},
@@ -59,7 +76,9 @@ var (
 	hasSkipList   atomic.Bool
 	blockList     atomic.Pointer[Trie]
 	skipList      atomic.Pointer[Trie]
+	userAgents    atomic.Pointer[[]string]
 	clientConfigs = make([]ClientConfig, 0)
+	sfGroup       = new(singleflight.Group)
 )
 
 var dnsCache = new(sync.Map)
@@ -77,6 +96,7 @@ func parseFlags() {
 	flag.StringVar(&keyFile, "key", "", "set key.pem file")
 	flag.StringVar(&skipListFile, "skiplist", "", "set skip list file")
 	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
+	flag.StringVar(&userAgentFile, "ua", "", "set user agent list file")
 	flag.StringVar(&defaultDNSResolver, "default-resolver", defaultDNSResolver, "set default dns server")
 	flag.BoolVar(&enabledLog, "log", enabledLog, "enable log")
 	flag.Func("proxy", "set proxy servers to query dns using random routes", func(s string) error {
@@ -142,43 +162,9 @@ func parseFlags() {
 	if !noProxyServers && len(proxyServers) == 0 {
 		proxyServers = defaultProxyServers
 	}
-}
-
-func reloadConfig() {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGHUP)
-
-	go func() {
-		for range sigs {
-			slog.Info("reloading configuration files")
-			if err := loadConfigs(); err != nil {
-				slog.Error("reloading configuration files", "err", err)
-			}
-		}
-	}()
-}
-
-func loadConfigs() error {
-	prevSkipList := skipList.Load()
-	skipListTrie, err := readConfigFile(skipListFile)
-	if err != nil {
-		return fmt.Errorf("read skip list: %w", err)
+	if len(userAgentFile) == 0 {
+		userAgents.Store(&defaultUserAgent)
 	}
-	skipList.Store(&skipListTrie)
-	hasSkipList.Store(!skipList.Load().IsZero())
-
-	blockListTrie, err := readConfigFile(blocklistFile)
-	if err != nil {
-		// rollback skip list
-		skipList.Store(prevSkipList)
-		hasSkipList.Store(!skipList.Load().IsZero())
-
-		return fmt.Errorf("read blocklist: %w", err)
-	}
-	blockList.Store(&blockListTrie)
-	hasBlocklist.Store(!blockList.Load().IsZero())
-
-	return nil
 }
 
 func main() {
@@ -255,6 +241,7 @@ func main() {
 	}
 
 	if enabledLog {
+		slog.Info("print user agents", "ua", userAgents.Load())
 		slog.Info("print proxy servers", "servers", proxyServers)
 		slog.Info("print dns servers", "servers", dnsServers)
 		slog.Info("print client configs", "clients", clientConfigs)
@@ -304,6 +291,89 @@ func main() {
 	<-ctx.Done()
 }
 
+func reloadConfig() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP)
+
+	go func() {
+		for range sigs {
+			slog.Info("reloading configuration files")
+			if err := loadConfigs(); err != nil {
+				slog.Error("reloading configuration files", "err", err)
+			}
+		}
+	}()
+}
+
+func loadConfigs() error {
+	// read skip list
+	prevSkipList := skipList.Load()
+	skipListTrie, err := readConfigFile(skipListFile)
+	if err != nil {
+		return fmt.Errorf("read skip list: %w", err)
+	}
+	skipList.Store(&skipListTrie)
+	hasSkipList.Store(!skipList.Load().IsZero())
+
+	// read block list
+	prevBlockList := blockList.Load()
+	blockListTrie, err := readConfigFile(blocklistFile)
+	if err != nil {
+		// rollback skip list
+		skipList.Store(prevSkipList)
+		hasSkipList.Store(!skipList.Load().IsZero())
+
+		return fmt.Errorf("read blocklist: %w", err)
+	}
+	blockList.Store(&blockListTrie)
+	hasBlocklist.Store(!blockList.Load().IsZero())
+
+	// read user agent (only when a file is specified)
+	if len(userAgentFile) > 0 {
+		fs, err := os.Open(userAgentFile)
+		if err != nil {
+			// rollback skip list
+			skipList.Store(prevSkipList)
+			hasSkipList.Store(!skipList.Load().IsZero())
+			// rollback block list
+			blockList.Store(prevBlockList)
+			hasBlocklist.Store(!blockList.Load().IsZero())
+
+			return fmt.Errorf("read user agent file: %w", err)
+		}
+		defer fs.Close()
+
+		sc := bufio.NewReader(fs)
+		var newUserAgent []string
+		for {
+			raw, _, err := sc.ReadLine()
+			if err != nil {
+				break
+			}
+			line := string(raw)
+			line = strings.TrimSpace(line)
+			// padding version (1.360. to 1.360.0)
+			if strings.HasSuffix(line, ".") {
+				line += "0"
+			}
+			newUserAgent = append(newUserAgent, line)
+		}
+		if len(newUserAgent) == 0 {
+			// rollback skip list
+			skipList.Store(prevSkipList)
+			hasSkipList.Store(!skipList.Load().IsZero())
+			// rollback block list
+			blockList.Store(prevBlockList)
+			hasBlocklist.Store(!blockList.Load().IsZero())
+
+			return errors.New("read user agent: empty user agents")
+		}
+		userAgents.Store(&newUserAgent)
+	}
+
+	return nil
+}
+
 type StartFn = func(context.Context, http.Handler, string, string) error
 
 func query(c *echo.Context, rawMsg []byte) error {
@@ -317,7 +387,9 @@ func query(c *echo.Context, rawMsg []byte) error {
 	}
 
 	// allow only type: A, AAAA and CNAME
-	if len(msg.Question) > 0 && (msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA && msg.Question[0].Qtype != dns.TypeCNAME) {
+	if len(msg.Question) != 1 ||
+		(msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA && msg.Question[0].Qtype != dns.TypeCNAME) ||
+		(msg.Question[0].Qclass == 0) {
 		newMsg := new(dns.Msg)
 		newMsg.SetReply(msg)
 		respBody, _ := newMsg.Pack()
@@ -370,21 +442,15 @@ func query(c *echo.Context, rawMsg []byte) error {
 	}
 
 	// query from upstream servers
-	resp, err := doRequest(c.Request().Context(), rawMsg)
+	q := msg.Question[0]
+	key := q.Name + dns.Type(q.Qtype).String()
+	respRawMsg, err := doRequest(c.Request().Context(), key, rawMsg)
 	if err != nil {
 		return newError(c, msg, err, "do request")
 	}
-	defer resp.Body.Close()
-
-	// parse response body
-	respRawMsg, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return newError(c, msg, err, "read response message")
-	}
-
 	respMsg := new(dns.Msg)
 	if err := respMsg.Unpack(respRawMsg); err != nil {
-		return newError(c, msg, err, "parse dns message")
+		return newError(c, msg, err, fmt.Sprintf("parse dns message (%q)", respRawMsg))
 	}
 
 	if len(respMsg.Answer) > 0 {
@@ -436,29 +502,51 @@ func resolveSkipUDP(ctx context.Context, rawMsg []byte) ([]byte, error) {
 	return buf[:n], nil
 }
 
-func doRequest(ctx context.Context, rawMsg []byte) (*http.Response, error) {
-	idx := rand.IntN(len(clientConfigs))
+func doRequest(ctx context.Context, key string, rawMsg []byte) ([]byte, error) {
+	result, err, _ := sfGroup.Do(key, func() (any, error) {
+		idx := rand.IntN(len(clientConfigs))
+		agent := userAgents.Load()
+		userAgent := (*agent)[rand.IntN(len(*agent))]
 
-	for _, dnsConfig := range clientConfigs[idx].DNSConfigs {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, dnsConfig.Host, bytes.NewReader(rawMsg))
-		if err != nil {
-			continue
-		}
-		req.ContentLength = int64(len(rawMsg))
-		req.Header.Set(echo.HeaderContentType, MIMEApplicationDNSMessage)
-		req.Header.Set(echo.HeaderAccept, MIMEApplicationDNSMessage)
+		for _, dnsConfig := range clientConfigs[idx].DNSConfigs {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, dnsConfig.Host, bytes.NewReader(rawMsg))
+			if err != nil {
+				continue
+			}
+			req.ContentLength = int64(len(rawMsg))
+			req.Header.Set(HeaderContentType, MIMEApplicationDNSMessage)
+			req.Header.Set(HeaderAccept, MIMEApplicationDNSMessage)
+			req.Header.Set(HeaderUserAgent, userAgent)
 
-		resp, err := clientConfigs[idx].Client.Do(req)
-		if err != nil {
-			continue
+			resp, err := clientConfigs[idx].Client.Do(req)
+			if err != nil {
+				continue
+			}
+			defer resp.Body.Close()
+
+			// parse response body
+			respRawMsg, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("read response message: %w", err)
+			}
+			return respRawMsg, nil
 		}
-		return resp, nil
+
+		return nil, errors.New("all upstream servers failed")
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, errors.New("all upstream servers failed")
+	return result.([]byte), nil
 }
 
 func echoPOST(c *echo.Context) error {
+	if enabledLog {
+		slog.Info("request header", "headers", c.Request().Header)
+	}
+
 	contentType := c.Request().Header.Get(echo.HeaderContentType)
 	if contentType != MIMEApplicationDNSMessage {
 		return newError(c, nil, nil, "query message not found")
@@ -543,7 +631,7 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 		}
 		rr := dns.Copy(cache.RR)
 		rr.Header().Ttl = uint32(ttl)
-		if ttl == 0 {
+		if rr.Header().Ttl == 0 {
 			rr.Header().Ttl = 1
 		}
 
@@ -714,7 +802,7 @@ func NewTrie() Trie {
 }
 
 func (t *Trie) IsZero() bool {
-	return len(t.children) == 0
+	return t == nil || len(t.children) == 0
 }
 
 func (t *Trie) Insert(domain string) {
@@ -773,4 +861,9 @@ const (
 	OnionSuffix = ".onion"
 )
 
-const MIMEApplicationDNSMessage = "application/dns-message"
+const (
+	HeaderAccept              = "Accept"
+	HeaderContentType         = "Content-Type"
+	HeaderUserAgent           = "User-Agent"
+	MIMEApplicationDNSMessage = "application/dns-message"
+)
