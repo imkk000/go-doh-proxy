@@ -316,18 +316,6 @@ func query(c *echo.Context, rawMsg []byte) error {
 		slog.Info("query", "q", msg.Question)
 	}
 
-	if hasSkipList.Load() {
-		for _, q := range msg.Question {
-			if skipList.Load().Match(q.Name) {
-				rawBody, err := resolveSkipUDP(c.Request().Context(), rawMsg)
-				if err != nil {
-					return newError(c, msg, err, "skip domain")
-				}
-				return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, rawBody)
-			}
-		}
-	}
-
 	// allow only type: A, AAAA and CNAME
 	if len(msg.Question) > 0 && (msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA && msg.Question[0].Qtype != dns.TypeCNAME) {
 		newMsg := new(dns.Msg)
@@ -336,11 +324,33 @@ func query(c *echo.Context, rawMsg []byte) error {
 		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 	}
 
+	// skip
+	if hasSkipList.Load() {
+		for _, q := range msg.Question {
+			if skipList.Load().Match(q.Name) {
+				rawBody, err := resolveSkipUDP(c.Request().Context(), rawMsg)
+				if err != nil {
+					return newError(c, msg, err, "skip domain")
+				}
+				if enabledLog {
+					msg := new(dns.Msg)
+					if err := msg.Unpack(rawBody); err == nil {
+						slog.Info("unpack (skiplist)", "q", msg.Question, "a", msg.Answer)
+					}
+				}
+				return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, rawBody)
+			}
+		}
+	}
+
 	// get cache
 	if msg, hit := getCache(msg); hit {
 		respBody, err := msg.Pack()
 		if err != nil {
 			return newError(c, msg, err, "hit cache")
+		}
+		if enabledLog {
+			slog.Info("unpack (hit cache)", "q", msg.Question, "a", msg.Answer)
 		}
 		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 	}
@@ -351,6 +361,9 @@ func query(c *echo.Context, rawMsg []byte) error {
 			respBody, err := msg.Pack()
 			if err != nil {
 				return newError(c, msg, err, "block domain")
+			}
+			if enabledLog {
+				slog.Info("unpack (blocked)", "q", msg.Question, "a", msg.Answer)
 			}
 			return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 		}
@@ -384,11 +397,14 @@ func query(c *echo.Context, rawMsg []byte) error {
 			})
 		}
 	}
-
 	respBody, err := respMsg.Pack()
 	if err != nil {
 		return newError(c, msg, err, "pack dns message")
 	}
+	if enabledLog {
+		slog.Info("unpack", "q", respMsg.Question, "a", respMsg.Answer)
+	}
+
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 }
 
@@ -682,15 +698,10 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
 		return
 	}
 
-	if enabledLog {
-		msg := new(dns.Msg)
-		err := msg.Unpack(rec.Body.Bytes())
-		if enabledLog && err == nil {
-			slog.Info("unpack", "q", msg.Question, "a", msg.Answer)
-		}
+	if _, err := conn.WriteToUDP(rec.Body.Bytes(), addr); err != nil {
+		slog.Error("write udp", "err", err)
+		return
 	}
-
-	conn.WriteToUDP(rec.Body.Bytes(), addr)
 }
 
 type Trie struct {
@@ -746,7 +757,7 @@ type Config struct {
 }
 
 type ClientConfig struct {
-	Client     *http.Client
+	Client     *http.Client `json:"-"`
 	DNSConfigs []DNSConfig
 }
 
