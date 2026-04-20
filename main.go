@@ -455,13 +455,15 @@ func query(c *echo.Context, rawMsg []byte) error {
 
 	if len(respMsg.Answer) > 0 {
 		// cache dns RR header
+		key := respMsg.Question[0].Name + dns.Type(respMsg.Question[0].Qtype).String()
+		cacheRR := make([]DNSCacheRR, 0)
 		for _, a := range respMsg.Answer {
-			key := a.Header().Name + dns.Type(a.Header().Rrtype).String()
-			dnsCache.Store(key, DNSCacheRR{
+			cacheRR = append(cacheRR, DNSCacheRR{
 				RR:     dns.Copy(a),
 				Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
 			})
 		}
+		dnsCache.Store(key, cacheRR)
 	}
 	respBody, err := respMsg.Pack()
 	if err != nil {
@@ -505,10 +507,11 @@ func resolveSkipUDP(ctx context.Context, rawMsg []byte) ([]byte, error) {
 func doRequest(ctx context.Context, key string, rawMsg []byte) ([]byte, error) {
 	result, err, _ := sfGroup.Do(key, func() (any, error) {
 		idx := rand.IntN(len(clientConfigs))
+		dnsConfigs := clientConfigs[idx].DNSConfigs
 		agent := userAgents.Load()
 		userAgent := (*agent)[rand.IntN(len(*agent))]
 
-		for _, dnsConfig := range clientConfigs[idx].DNSConfigs {
+		for _, dnsConfig := range dnsConfigs {
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, dnsConfig.Host, bytes.NewReader(rawMsg))
 			if err != nil {
 				continue
@@ -527,8 +530,9 @@ func doRequest(ctx context.Context, key string, rawMsg []byte) ([]byte, error) {
 			// parse response body
 			respRawMsg, err := io.ReadAll(resp.Body)
 			if err != nil {
-				return nil, fmt.Errorf("read response message: %w", err)
+				continue
 			}
+
 			return respRawMsg, nil
 		}
 
@@ -600,10 +604,12 @@ func evictDNSCache() {
 
 	cleanFn := func() {
 		dnsCache.Range(func(key any, val any) bool {
-			rr := val.(DNSCacheRR)
-			ttl := time.Until(rr.Expiry).Seconds()
-			if ttl <= 0 {
-				dnsCache.Delete(key)
+			cacheRR := val.([]DNSCacheRR)
+			for _, rr := range cacheRR {
+				if time.Until(rr.Expiry).Seconds() <= 0 {
+					dnsCache.Delete(key)
+					break
+				}
 			}
 			return true
 		})
@@ -622,20 +628,22 @@ func getCache(msg *dns.Msg) (*dns.Msg, bool) {
 		key := q.Name + dns.Type(q.Qtype).String()
 		val, hit := dnsCache.Load(key)
 		if !hit {
-			continue
-		}
-		cache := val.(DNSCacheRR)
-		ttl := time.Until(cache.Expiry).Seconds()
-		if ttl <= 0 {
-			continue
-		}
-		rr := dns.Copy(cache.RR)
-		rr.Header().Ttl = uint32(ttl)
-		if rr.Header().Ttl == 0 {
-			rr.Header().Ttl = 1
+			return msg, false
 		}
 
-		newMsg.Answer = append(newMsg.Answer, rr)
+		cacheRR := val.([]DNSCacheRR)
+		for _, rr := range cacheRR {
+			ttl := time.Until(rr.Expiry).Seconds()
+			if ttl <= 0 {
+				return msg, false
+			}
+			rr := dns.Copy(rr.RR)
+			rr.Header().Ttl = uint32(ttl)
+			if rr.Header().Ttl == 0 {
+				rr.Header().Ttl = 1
+			}
+			newMsg.Answer = append(newMsg.Answer, rr)
+		}
 	}
 
 	if len(newMsg.Answer) == 0 {
@@ -771,7 +779,9 @@ func StartUDPServer() {
 		if err != nil {
 			continue
 		}
-		go handleUDP(conn, remoteAddr, buf[:n])
+		data := make([]byte, n)
+		copy(data, buf[:n])
+		go handleUDP(conn, remoteAddr, data)
 	}
 }
 

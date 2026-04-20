@@ -111,7 +111,7 @@ curl -s \
 - Concurrent identical queries are deduplicated via singleflight — only one upstream request is made
 - Multiple `--proxy` servers are selected randomly per request
 - Multiple `--dns` servers are tried in index order; first success wins
-- `tor;` proxy prefix: that proxy only routes to `.onion` DNS endpoints
+- `tor;` proxy prefix: that proxy can also route to `.onion` DNS endpoints; regular proxies skip `.onion` DNS servers entirely
 - DNS servers with `.onion` hosts are skipped when proxies are disabled (`--proxy=off`)
 - Skip list domains bypass DoH entirely and are resolved via plain UDP to `--default-resolver`
 - Use `proxychains` as an alternative to a SOCKS5 proxy
