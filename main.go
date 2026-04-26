@@ -66,9 +66,6 @@ var (
 		{1, "https://all.dns.mullvad.net/dns-query", TypeDefault},
 		{2, "https://security.cloudflare-dns.com/dns-query", TypeDefault},
 	}
-	defaultProxyServers = []Config{
-		{"127.0.0.1:9050", TypeDefault},
-	}
 )
 
 var (
@@ -159,9 +156,6 @@ func parseFlags() {
 	slices.SortFunc(dnsServers, func(a, b DNSConfig) int {
 		return a.ID - b.ID
 	})
-	if !noProxyServers && len(proxyServers) == 0 {
-		proxyServers = defaultProxyServers
-	}
 	if len(userAgentFile) == 0 {
 		userAgents.Store(&defaultUserAgent)
 	}
@@ -386,9 +380,11 @@ func query(c *echo.Context, rawMsg []byte) error {
 		slog.Info("query", "q", msg.Question)
 	}
 
-	// allow only type: A, AAAA and CNAME
+	// allow only type: A, AAAA, CNAME, SRV, TXT
 	if len(msg.Question) != 1 ||
-		(msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA && msg.Question[0].Qtype != dns.TypeCNAME) ||
+		(msg.Question[0].Qtype != dns.TypeSRV && msg.Question[0].Qtype != dns.TypeTXT &&
+			msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA &&
+			msg.Question[0].Qtype != dns.TypeCNAME) ||
 		(msg.Question[0].Qclass == 0) {
 		newMsg := new(dns.Msg)
 		newMsg.SetReply(msg)

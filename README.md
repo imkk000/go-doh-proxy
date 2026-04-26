@@ -52,7 +52,7 @@ go run . \
 | `--udp`              | _(disabled)_                 | UDP listen address; omit to disable UDP server                                                  |
 | `--cert`             |                              | TLS certificate file (required unless `--http`)                                                 |
 | `--key`              |                              | TLS private key file (required unless `--http`)                                                 |
-| `--proxy`            | `127.0.0.1:9050`             | SOCKS5 proxy; use `off` to disable; prefix `tor;` for Tor-only routing; supports multiple       |
+| `--proxy`            | _(none)_                     | SOCKS5 proxy; use `off` for direct connection; prefix `tor;` for Tor-only routing; supports multiple |
 | `--dns`              | quad9, mullvad, cloudflare   | Upstream DoH server in `<index>;<url>` format; lower index = higher priority; supports multiple |
 | `--ua`               | _(built-in browser UA list)_ | Path to a file of User-Agent strings (one per line) sent to upstream DoH servers                |
 | `--skiplist`         |                              | Skip list file, one domain per line; matched domains bypass DoH and resolve via UDP             |
@@ -100,12 +100,12 @@ curl -s \
   "https://127.0.0.1:9553/dns-query?dns=<base64url>"
 ```
 
-> Only query types `A`, `AAAA`, and `CNAME` are forwarded upstream. All other types receive an empty reply.
+> Only query types `A`, `AAAA`, `CNAME`, `SRV`, and `TXT` are forwarded upstream. All other types receive an empty reply.
 
 ## Notes
 
 - Send `SIGHUP` to reload `--skiplist`, `--blocklist`, and `--ua` files without restarting
-- Only DNS query types `A`, `AAAA`, and `CNAME` are resolved; others return an empty reply
+- Only DNS query types `A`, `AAAA`, `CNAME`, `SRV`, and `TXT` are resolved; others return an empty reply
 - Blocked domains return `0.0.0.0` for type A or `::` for type AAAA (TTL 300)
 - DNS responses are cached in-memory by TTL; cache is evicted every 10 minutes
 - Concurrent identical queries are deduplicated via singleflight — only one upstream request is made
