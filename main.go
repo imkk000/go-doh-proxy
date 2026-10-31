@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -76,17 +77,45 @@ var (
 	clientConfigs []ClientConfig
 	sfGroup       = new(singleflight.Group)
 	dnsCache      = new(sync.Map)
+	dnsCacheSize  atomic.Int64
 	skipUDPClient = &dns.Client{Net: "udp", Timeout: 5 * time.Second}
 	skipTCPClient = &dns.Client{Net: "tcp", Timeout: 5 * time.Second}
 )
 
 var errInvalidQuery = errors.New("invalid query message")
 
-const upstreamTimeout = 30 * time.Second
+const (
+	upstreamTimeout    = 30 * time.Second
+	attemptTimeout     = 10 * time.Second
+	failureThreshold   = 3
+	failureCooldown    = 60 * time.Second
+	ednsUDPSize        = 1232
+	paddingBlockSize   = 128
+	maxCacheEntries    = 100_000
+	maxCacheTTL        = 7 * 24 * 3600
+	maxNegativeTTL     = 3600
+	maxStale           = 24 * time.Hour
+	staleTTL           = 30
+	staleClientTimeout = 1800 * time.Millisecond
+	staleRecheckDelay  = 30 * time.Second
+)
 
-type DNSCacheRR struct {
-	RR     dns.RR
-	Expiry time.Time
+type cacheState int
+
+const (
+	cacheMiss cacheState = iota
+	cacheFresh
+	cacheStale
+	cacheStaleRecheckPending
+)
+
+type cacheEntry struct {
+	Rcode        int
+	Answer       []dns.RR
+	Ns           []dns.RR
+	Stored       time.Time
+	Expiry       time.Time
+	recheckAfter atomic.Int64
 }
 
 func parseFlags(args []string) error {
@@ -234,11 +263,11 @@ func newClientConfigs() ([]ClientConfig, error) {
 		}
 		dialer := &net.Dialer{Timeout: upstreamTimeout, KeepAlive: 30 * time.Second}
 		return []ClientConfig{{
-			DNSConfigs: dnsServers,
-			Client: newHTTPClient(&http.Transport{
+			Targets: newTargets(dnsServers),
+			Upstream: httpUpstream{newHTTPClient(&http.Transport{
 				Proxy:       http.ProxyFromEnvironment,
 				DialContext: dialer.DialContext,
-			}),
+			})},
 		}}, nil
 	}
 
@@ -260,8 +289,8 @@ func newClientConfigs() ([]ClientConfig, error) {
 			return nil, fmt.Errorf("no dns servers available for proxy server %q", proxyServer.Host)
 		}
 		configs = append(configs, ClientConfig{
-			DNSConfigs: dnsConfigs,
-			Client:     newHTTPClient(&http.Transport{DialContext: dialer.DialContext}),
+			Targets:  newTargets(dnsConfigs),
+			Upstream: httpUpstream{newHTTPClient(&http.Transport{DialContext: dialer.DialContext})},
 		})
 	}
 
@@ -410,10 +439,10 @@ func resolve(ctx context.Context, rawMsg []byte) ([]byte, error) {
 	if err := msg.Unpack(rawMsg); err != nil {
 		return nil, fmt.Errorf("%w: %w", errInvalidQuery, err)
 	}
-	return answer(ctx, msg, rawMsg), nil
+	return answer(ctx, msg), nil
 }
 
-func answer(ctx context.Context, msg *dns.Msg, rawMsg []byte) []byte {
+func answer(ctx context.Context, msg *dns.Msg) []byte {
 	if enabledLog {
 		slog.Info("query", "q", msg.Question)
 	}
@@ -426,15 +455,22 @@ func answer(ctx context.Context, msg *dns.Msg, rawMsg []byte) []byte {
 		return resolveSkipped(ctx, msg)
 	}
 
-	if cached, hit := getCache(msg); hit {
-		return packResponse(msg, cached, "cache")
-	}
-
 	if blocked, isBlocked := answerBlocklist(msg); isBlocked {
 		return packResponse(msg, blocked, "blocklist")
 	}
 
-	return resolveUpstream(ctx, msg, rawMsg)
+	cached, state := getCache(msg)
+	switch state {
+	case cacheFresh:
+		return packResponse(msg, cached, "cache")
+	case cacheStale:
+		return resolveStale(ctx, msg, cached)
+	case cacheStaleRecheckPending:
+		return packResponse(msg, cached, "stale")
+	case cacheMiss:
+	}
+
+	return resolveUpstream(ctx, msg)
 }
 
 func isSupportedQuery(msg *dns.Msg) bool {
@@ -454,22 +490,73 @@ func resolveSkipped(ctx context.Context, msg *dns.Msg) []byte {
 	return packResponse(msg, respMsg, "skiplist")
 }
 
-func resolveUpstream(ctx context.Context, msg *dns.Msg, rawMsg []byte) []byte {
+func resolveUpstream(ctx context.Context, msg *dns.Msg) []byte {
 	q := msg.Question[0]
-	respRawMsg, err := doRequest(ctx, cacheKey(q), rawMsg)
+	respMsg, err := doRequest(ctx, q)
 	if err != nil {
 		return serverFailure(msg, err, "do request")
 	}
-	respMsg := new(dns.Msg)
-	if err := respMsg.Unpack(respRawMsg); err != nil {
-		return serverFailure(msg, err, "parse upstream dns message")
+	return packResponse(msg, upstreamReply(msg, respMsg), "upstream")
+}
+
+func resolveStale(ctx context.Context, msg, stale *dns.Msg) []byte {
+	q := msg.Question[0]
+	refreshed := sfGroup.DoChan(cacheKey(q), refreshFunc(ctx, q))
+
+	timer := time.NewTimer(staleClientTimeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-refreshed:
+		respMsg, ok := result.Val.(*dns.Msg)
+		if ok && result.Err == nil && isAnswerRcode(respMsg.Rcode) {
+			return packResponse(msg, upstreamReply(msg, respMsg), "upstream")
+		}
+	case <-timer.C:
 	}
-	respMsg.Id = msg.Id
-	respMsg.Question = msg.Question
 
-	storeCache(q, respMsg)
+	return packResponse(msg, stale, "stale")
+}
 
-	return packResponse(msg, respMsg, "upstream")
+func isAnswerRcode(rcode int) bool {
+	return rcode == dns.RcodeSuccess || rcode == dns.RcodeNameError
+}
+
+func upstreamReply(msg, respMsg *dns.Msg) *dns.Msg {
+	reply := *respMsg
+	reply.Id = msg.Id
+	reply.Question = msg.Question
+	reply.Extra = slices.Clone(respMsg.Extra)
+	setResponseOPT(msg, &reply)
+	return &reply
+}
+
+func buildUpstreamQuery(q dns.Question) ([]byte, error) {
+	query := new(dns.Msg)
+	query.RecursionDesired = true
+	query.Question = []dns.Question{{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass}}
+	query.SetEdns0(ednsUDPSize, false)
+
+	unpadded, err := query.Pack()
+	if err != nil {
+		return nil, err
+	}
+	paddingLen := (paddingBlockSize - (len(unpadded)+4)%paddingBlockSize) % paddingBlockSize
+	opt := query.IsEdns0()
+	opt.Option = append(opt.Option, &dns.EDNS0_PADDING{Padding: make([]byte, paddingLen)})
+
+	return query.Pack()
+}
+
+func setResponseOPT(msg, respMsg *dns.Msg) {
+	respMsg.Extra = slices.DeleteFunc(respMsg.Extra, isOPT)
+	if msg.IsEdns0() != nil {
+		respMsg.SetEdns0(ednsUDPSize, false)
+	}
+}
+
+func isOPT(rr dns.RR) bool {
+	return rr.Header().Rrtype == dns.TypeOPT
 }
 
 func packResponse(msg, respMsg *dns.Msg, source string) []byte {
@@ -487,6 +574,7 @@ func newReply(msg *dns.Msg) *dns.Msg {
 	reply := new(dns.Msg)
 	reply.SetReply(msg)
 	reply.RecursionAvailable = true
+	setResponseOPT(msg, reply)
 	return reply
 }
 
@@ -494,43 +582,125 @@ func serverFailure(msg *dns.Msg, err error, message string) []byte {
 	slog.Error(message, "query", msg.Question, "error", err)
 	respMsg := new(dns.Msg)
 	respMsg.SetRcode(msg, dns.RcodeServerFailure)
+	setResponseOPT(msg, respMsg)
 	respBody, _ := respMsg.Pack()
 	return respBody
 }
 
-func doRequest(ctx context.Context, key string, rawMsg []byte) ([]byte, error) {
-	result, err, _ := sfGroup.Do(key, func() (any, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamTimeout)
-		defer cancel()
-
-		clientConfig := clientConfigs[randomIndex(len(clientConfigs))]
-		agents := *userAgents.Load()
-		userAgent := agents[randomIndex(len(agents))]
-
-		var errs []error
-		for _, dnsConfig := range clientConfig.DNSConfigs {
-			respRawMsg, err := fetchUpstream(ctx, clientConfig.Client, dnsConfig.Host, userAgent, rawMsg)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			return respRawMsg, nil
-		}
-
-		return nil, fmt.Errorf("all upstream servers failed: %w", errors.Join(errs...))
-	})
+func doRequest(ctx context.Context, q dns.Question) (*dns.Msg, error) {
+	result, err, _ := sfGroup.Do(cacheKey(q), refreshFunc(ctx, q))
 	if err != nil {
 		return nil, err
 	}
 
-	respRawMsg, ok := result.([]byte)
+	respMsg, ok := result.(*dns.Msg)
 	if !ok {
 		return nil, fmt.Errorf("unexpected upstream result type %T", result)
 	}
-	return respRawMsg, nil
+	return respMsg, nil
 }
 
-func fetchUpstream(ctx context.Context, client *http.Client, host, userAgent string, rawMsg []byte) ([]byte, error) {
+func refreshFunc(ctx context.Context, q dns.Question) func() (any, error) {
+	return func() (any, error) {
+		return refresh(context.WithoutCancel(ctx), q)
+	}
+}
+
+func refresh(ctx context.Context, q dns.Question) (*dns.Msg, error) {
+	respMsg, err := exchangeUpstream(ctx, q)
+	if err != nil || !isAnswerRcode(respMsg.Rcode) {
+		markRefreshFailed(q, time.Now())
+	}
+	if err != nil {
+		return nil, err
+	}
+	storeCache(q, respMsg)
+	return respMsg, nil
+}
+
+func markRefreshFailed(q dns.Question, now time.Time) {
+	val, ok := dnsCache.Load(cacheKey(q))
+	if !ok {
+		return
+	}
+	if entry, ok := val.(*cacheEntry); ok {
+		entry.recheckAfter.Store(now.Add(staleRecheckDelay).UnixNano())
+	}
+}
+
+func exchangeUpstream(ctx context.Context, q dns.Question) (*dns.Msg, error) {
+	query, err := buildUpstreamQuery(q)
+	if err != nil {
+		return nil, fmt.Errorf("build upstream query: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
+
+	agents := *userAgents.Load()
+	userAgent := agents[randomIndex(len(agents))]
+
+	var errs []error
+	for _, c := range upstreamCandidates(time.Now()) {
+		respMsg, err := c.exchange(ctx, userAgent, query)
+		if err == nil {
+			return respMsg, nil
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("all upstream servers failed: %w", errors.Join(errs...))
+}
+
+func upstreamCandidates(now time.Time) []candidate {
+	offset := randomIndex(len(clientConfigs))
+	var healthy, cooling []candidate
+	for i := range len(clientConfigs) {
+		config := clientConfigs[(offset+i)%len(clientConfigs)]
+		for _, target := range config.Targets {
+			c := candidate{upstream: config.Upstream, target: target}
+			if target.available(now) {
+				healthy = append(healthy, c)
+			} else {
+				cooling = append(cooling, c)
+			}
+		}
+	}
+	return append(healthy, cooling...)
+}
+
+func (c candidate) exchange(ctx context.Context, userAgent string, query []byte) (*dns.Msg, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+	defer cancel()
+
+	start := time.Now()
+	respMsg, err := exchangeMsg(attemptCtx, c.upstream, c.target.Host, userAgent, query)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.target.recordFailure(start, time.Now())
+		}
+		return nil, err
+	}
+	c.target.recordSuccess()
+	return respMsg, nil
+}
+
+func exchangeMsg(ctx context.Context, upstream Upstream, host, userAgent string, query []byte) (*dns.Msg, error) {
+	respRawMsg, err := upstream.Exchange(ctx, host, userAgent, query)
+	if err != nil {
+		return nil, err
+	}
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respRawMsg); err != nil {
+		return nil, fmt.Errorf("parse response %s: %w", host, err)
+	}
+	return respMsg, nil
+}
+
+func (u httpUpstream) Exchange(ctx context.Context, host, userAgent string, rawMsg []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host, bytes.NewReader(rawMsg))
 	if err != nil {
 		return nil, fmt.Errorf("new request %s: %w", host, err)
@@ -539,7 +709,7 @@ func fetchUpstream(ctx context.Context, client *http.Client, host, userAgent str
 	req.Header.Set(HeaderAccept, MIMEApplicationDNSMessage)
 	req.Header.Set(HeaderUserAgent, userAgent)
 
-	resp, err := client.Do(req)
+	resp, err := u.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", host, err)
 	}
@@ -606,62 +776,153 @@ func evictDNSCache(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			dnsCache.Range(func(key, val any) bool {
-				cacheRR, ok := val.([]DNSCacheRR)
-				if !ok || slices.ContainsFunc(cacheRR, isExpired) {
-					dnsCache.Delete(key)
-				}
-				return true
-			})
+			evictCache(time.Now())
 		}
 	}
 }
 
-func isExpired(rr DNSCacheRR) bool {
-	return time.Until(rr.Expiry) <= 0
+func evictCache(now time.Time) {
+	full := dnsCacheSize.Load() >= maxCacheEntries
+	dnsCache.Range(func(key, val any) bool {
+		entry, ok := val.(*cacheEntry)
+		if !ok || !now.Before(entry.Expiry.Add(maxStale)) || (full && !now.Before(entry.Expiry)) {
+			if dnsCache.CompareAndDelete(key, val) {
+				dnsCacheSize.Add(-1)
+			}
+		}
+		return true
+	})
 }
 
 func cacheKey(q dns.Question) string {
-	return strings.ToLower(q.Name) + dns.Type(q.Qtype).String()
+	return strings.ToLower(q.Name) + " " + dns.Class(q.Qclass).String() + " " + dns.Type(q.Qtype).String()
 }
 
 func storeCache(q dns.Question, respMsg *dns.Msg) {
-	if len(respMsg.Answer) == 0 {
+	entry, ok := newCacheEntry(q, respMsg, time.Now())
+	if !ok {
 		return
 	}
-	now := time.Now()
-	cacheRR := make([]DNSCacheRR, 0, len(respMsg.Answer))
-	for _, a := range respMsg.Answer {
-		cacheRR = append(cacheRR, DNSCacheRR{
-			RR:     dns.Copy(a),
-			Expiry: now.Add(time.Duration(a.Header().Ttl) * time.Second),
-		})
+	key := cacheKey(q)
+	if _, exists := dnsCache.Load(key); !exists && dnsCacheSize.Load() >= maxCacheEntries {
+		return
 	}
-	dnsCache.Store(cacheKey(q), cacheRR)
+	if _, loaded := dnsCache.Swap(key, entry); !loaded {
+		dnsCacheSize.Add(1)
+	}
 }
 
-func getCache(msg *dns.Msg) (*dns.Msg, bool) {
-	val, hit := dnsCache.Load(cacheKey(msg.Question[0]))
-	if !hit {
-		return nil, false
-	}
-	cacheRR, ok := val.([]DNSCacheRR)
-	if !ok || len(cacheRR) == 0 {
+func newCacheEntry(q dns.Question, respMsg *dns.Msg, now time.Time) (*cacheEntry, bool) {
+	if respMsg.Truncated || !isAnswerRcode(respMsg.Rcode) {
 		return nil, false
 	}
 
-	newMsg := newReply(msg)
-	for _, rr := range cacheRR {
-		ttl := time.Until(rr.Expiry)
-		if ttl <= 0 {
+	entry := &cacheEntry{Rcode: respMsg.Rcode, Answer: cacheableRRs(respMsg.Answer), Stored: now}
+	ttl := minTTL(entry.Answer, maxCacheTTL)
+	if respMsg.Rcode == dns.RcodeNameError || !answersQuestion(q, entry.Answer) {
+		entry.Ns = cacheableRRs(respMsg.Ns)
+		negTTL, ok := negativeTTL(entry.Ns)
+		if !ok {
 			return nil, false
 		}
-		cached := dns.Copy(rr.RR)
-		cached.Header().Ttl = max(uint32(ttl.Seconds()), 1)
-		newMsg.Answer = append(newMsg.Answer, cached)
+		ttl = min(ttl, negTTL)
+		for _, rr := range entry.Ns {
+			rr.Header().Ttl = min(rr.Header().Ttl, ttl)
+		}
+	}
+	if ttl == 0 {
+		return nil, false
 	}
 
-	return newMsg, true
+	entry.Expiry = now.Add(time.Duration(ttl) * time.Second)
+	return entry, true
+}
+
+func answersQuestion(q dns.Question, answer []dns.RR) bool {
+	return slices.ContainsFunc(answer, func(rr dns.RR) bool {
+		return rr.Header().Rrtype == q.Qtype
+	})
+}
+
+func cacheableRRs(rrs []dns.RR) []dns.RR {
+	copied := copyRRs(rrs)
+	for _, rr := range copied {
+		hdr := rr.Header()
+		if hdr.Ttl > math.MaxInt32 {
+			hdr.Ttl = 0
+		}
+		hdr.Ttl = min(hdr.Ttl, maxCacheTTL)
+	}
+	return copied
+}
+
+func negativeTTL(ns []dns.RR) (uint32, bool) {
+	for _, rr := range ns {
+		if soa, ok := rr.(*dns.SOA); ok {
+			return min(soa.Hdr.Ttl, soa.Minttl, maxNegativeTTL), true
+		}
+	}
+	return 0, false
+}
+
+func minTTL(rrs []dns.RR, limit uint32) uint32 {
+	for _, rr := range rrs {
+		limit = min(limit, rr.Header().Ttl)
+	}
+	return limit
+}
+
+func copyRRs(rrs []dns.RR) []dns.RR {
+	copied := make([]dns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		copied = append(copied, dns.Copy(rr))
+	}
+	return copied
+}
+
+func getCache(msg *dns.Msg) (*dns.Msg, cacheState) {
+	val, hit := dnsCache.Load(cacheKey(msg.Question[0]))
+	if !hit {
+		return nil, cacheMiss
+	}
+	entry, ok := val.(*cacheEntry)
+	if !ok {
+		return nil, cacheMiss
+	}
+
+	now := time.Now()
+	switch {
+	case now.Before(entry.Expiry):
+		elapsed := now.Sub(entry.Stored)
+		return cachedReply(msg, entry, func(ttl uint32) uint32 {
+			return uint32(max(time.Duration(ttl)*time.Second-elapsed, time.Second).Seconds())
+		}), cacheFresh
+	case now.Before(entry.Expiry.Add(maxStale)):
+		state := cacheStale
+		if now.UnixNano() < entry.recheckAfter.Load() {
+			state = cacheStaleRecheckPending
+		}
+		return cachedReply(msg, entry, func(uint32) uint32 {
+			return staleTTL
+		}), state
+	}
+	return nil, cacheMiss
+}
+
+func cachedReply(msg *dns.Msg, entry *cacheEntry, ttl func(uint32) uint32) *dns.Msg {
+	reply := newReply(msg)
+	reply.Rcode = entry.Rcode
+	reply.Answer = cachedRRs(entry.Answer, ttl)
+	reply.Ns = cachedRRs(entry.Ns, ttl)
+	return reply
+}
+
+func cachedRRs(rrs []dns.RR, ttl func(uint32) uint32) []dns.RR {
+	cached := copyRRs(rrs)
+	for _, rr := range cached {
+		rr.Header().Ttl = ttl(rr.Header().Ttl)
+	}
+	return cached
 }
 
 func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
@@ -754,7 +1015,7 @@ func handleUDP(conn *net.UDPConn, remoteAddr netip.AddrPort, rawMsg []byte) {
 		return
 	}
 
-	respBody := truncateUDP(msg, answer(context.Background(), msg, rawMsg))
+	respBody := truncateUDP(msg, answer(context.Background(), msg))
 	if _, err := conn.WriteToUDPAddrPort(respBody, remoteAddr); err != nil {
 		slog.Error("write udp", "error", err)
 	}
@@ -833,8 +1094,55 @@ type Config struct {
 }
 
 type ClientConfig struct {
-	Client     *http.Client `json:"-"`
-	DNSConfigs []DNSConfig
+	Upstream Upstream `json:"-"`
+	Targets  []*Target
+}
+
+type Target struct {
+	DNSConfig
+	failures    atomic.Int32
+	lastFailure atomic.Int64
+	downUntil   atomic.Int64
+}
+
+func newTargets(dnsConfigs []DNSConfig) []*Target {
+	targets := make([]*Target, 0, len(dnsConfigs))
+	for _, dnsConfig := range dnsConfigs {
+		targets = append(targets, &Target{DNSConfig: dnsConfig})
+	}
+	return targets
+}
+
+func (t *Target) available(now time.Time) bool {
+	return now.UnixNano() >= t.downUntil.Load()
+}
+
+func (t *Target) recordFailure(start, now time.Time) {
+	last := t.lastFailure.Load()
+	if start.UnixNano() < last || !t.lastFailure.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	if t.failures.Add(1) >= failureThreshold {
+		t.downUntil.Store(now.Add(failureCooldown).UnixNano())
+	}
+}
+
+func (t *Target) recordSuccess() {
+	t.failures.Store(0)
+	t.downUntil.Store(0)
+}
+
+type candidate struct {
+	upstream Upstream
+	target   *Target
+}
+
+type Upstream interface {
+	Exchange(ctx context.Context, host, userAgent string, rawMsg []byte) ([]byte, error)
+}
+
+type httpUpstream struct {
+	client *http.Client
 }
 
 type Type int

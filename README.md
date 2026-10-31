@@ -45,20 +45,20 @@ go run . \
 
 ## Options
 
-| Flag                 | Default                      | Description                                                                                     |
-| -------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------- |
-| `--http`             | `false`                      | Run server with HTTP instead of HTTPS (skips cert/key requirement)                              |
-| `--addr`             | `127.0.0.1:9553`             | HTTPS/HTTP listen address                                                                       |
-| `--udp`              | _(disabled)_                 | UDP listen address; omit to disable UDP server                                                  |
-| `--cert`             |                              | TLS certificate file (required unless `--http`)                                                 |
-| `--key`              |                              | TLS private key file (required unless `--http`)                                                 |
+| Flag                 | Default                      | Description                                                                                          |
+| -------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--http`             | `false`                      | Run server with HTTP instead of HTTPS (skips cert/key requirement)                                   |
+| `--addr`             | `127.0.0.1:9553`             | HTTPS/HTTP listen address                                                                            |
+| `--udp`              | _(disabled)_                 | UDP listen address; omit to disable UDP server                                                       |
+| `--cert`             |                              | TLS certificate file (required unless `--http`)                                                      |
+| `--key`              |                              | TLS private key file (required unless `--http`)                                                      |
 | `--proxy`            | _(none)_                     | SOCKS5 proxy; use `off` for direct connection; prefix `tor;` for Tor-only routing; supports multiple |
-| `--dns`              | quad9, mullvad, cloudflare   | Upstream DoH server in `<index>;<url>` format; lower index = higher priority; supports multiple |
-| `--ua`               | _(built-in browser UA list)_ | Path to a file of User-Agent strings (one per line) sent to upstream DoH servers                |
-| `--skiplist`         |                              | Skip list file, one domain per line; matched domains bypass DoH and resolve via UDP             |
-| `--default-resolver` | `host.docker.internal:53`    | UDP resolver used for skip list domains                                                         |
-| `--blocklist`        |                              | Blocklist file, one domain per line (suffix match)                                              |
-| `--log`              | `false`                      | Enable request logging                                                                          |
+| `--dns`              | quad9, mullvad, cloudflare   | Upstream DoH server in `<index>;<url>` format; lower index = higher priority; supports multiple      |
+| `--ua`               | _(built-in browser UA list)_ | Path to a file of User-Agent strings (one per line) sent to upstream DoH servers                     |
+| `--skiplist`         |                              | Skip list file, one domain per line; matched domains bypass DoH and resolve via UDP                  |
+| `--default-resolver` | `host.docker.internal:53`    | UDP resolver used for skip list domains                                                              |
+| `--blocklist`        |                              | Blocklist file, one domain per line (suffix match)                                                   |
+| `--log`              | `false`                      | Enable request logging                                                                               |
 
 ## API
 
@@ -106,11 +106,16 @@ curl -s \
 
 - Send `SIGHUP` to reload `--skiplist`, `--blocklist`, and `--ua` files without restarting
 - Only DNS query types `A`, `AAAA`, `CNAME`, `SRV`, and `TXT` are resolved; others return an empty reply
-- Blocked domains return `0.0.0.0` for type A or `::` for type AAAA (TTL 300)
-- DNS responses are cached in-memory by TTL; cache is evicted every 10 minutes
+- Blocked domains return `0.0.0.0` for type A or `::` for type AAAA (TTL 300); the blocklist is checked before the cache, so a reloaded blocklist applies immediately
+- Positive responses are cached in-memory by their minimum answer TTL, capped at 7 days; TTLs with the high bit set are treated as 0 and not cached
+- Negative responses (NXDOMAIN, and NODATA including a CNAME chain without the requested type) are cached only with an SOA, for the SOA minimum TTL capped at 1 hour
+- The cache holds at most 100,000 entries; every 10 minutes entries more than 24h past expiry are evicted, and all expired entries are evicted while the cache is full
+- Serve-stale (RFC 8767): an entry expired by less than 24h triggers a refresh; if the refresh errors, returns an rcode other than NOERROR/NXDOMAIN, or takes longer than 1.8s, the stale answer is returned with TTL 30; after a failed refresh, stale answers are returned immediately for 30s before refreshing again
+- Upstream queries are rebuilt from the question only: message ID 0, only RD set, no client EDNS options (ECS, cookies, DO/CD), and EDNS padding to 128-byte blocks; clients get a fresh OPT record only if they sent one
 - Concurrent identical queries are deduplicated via singleflight — only one upstream request is made
-- Multiple `--proxy` servers are selected randomly per request
-- Multiple `--dns` servers are tried in index order; first success wins
+- Upstream requests start at a random `--proxy` and fail over across all proxies; within each proxy, `--dns` servers are tried in index order and the first success wins
+- Each upstream attempt has a 10s timeout within a 30s total budget; transport errors, non-200 statuses, and unparsable bodies trigger failover, while SERVFAIL and REFUSED are returned as-is
+- A (proxy, DNS server) pair that fails 3 times in a row is skipped for 60s (overlapping failures from concurrent requests count once); if every pair is cooling down, they are still tried as a last resort
 - `tor;` proxy prefix: that proxy can also route to `.onion` DNS endpoints; regular proxies skip `.onion` DNS servers entirely
 - DNS servers with `.onion` hosts are skipped when proxies are disabled (`--proxy=off`)
 - Skip list domains bypass DoH entirely and are resolved via plain UDP to `--default-resolver`
