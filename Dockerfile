@@ -1,4 +1,4 @@
-FROM docker.io/golang:1.26-alpine3.23 as builder
+FROM docker.io/golang:1.27-alpine3.24 as builder
 
 WORKDIR /builder
 COPY go.mod go.sum ./
@@ -7,7 +7,7 @@ RUN go mod download
 COPY . .
 RUN go build --ldflags="-w -s" -o main .
 
-FROM docker.io/alpine:3.23
+FROM docker.io/alpine:3.24
 
 WORKDIR /opt/doh
 COPY --from=builder /builder/main server

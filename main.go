@@ -3,17 +3,18 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"os"
@@ -29,7 +30,6 @@ import (
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
 	"github.com/miekg/dns"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 	"golang.org/x/sync/singleflight"
 )
@@ -66,37 +66,42 @@ var (
 		{1, "https://all.dns.mullvad.net/dns-query", TypeDefault},
 		{2, "https://security.cloudflare-dns.com/dns-query", TypeDefault},
 	}
+	supportedQtypes = []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeSRV, dns.TypeTXT}
 )
 
 var (
-	hasBlocklist  atomic.Bool
-	hasSkipList   atomic.Bool
 	blockList     atomic.Pointer[Trie]
 	skipList      atomic.Pointer[Trie]
 	userAgents    atomic.Pointer[[]string]
-	clientConfigs = make([]ClientConfig, 0)
+	clientConfigs []ClientConfig
 	sfGroup       = new(singleflight.Group)
+	dnsCache      = new(sync.Map)
+	skipUDPClient = &dns.Client{Net: "udp", Timeout: 5 * time.Second}
+	skipTCPClient = &dns.Client{Net: "tcp", Timeout: 5 * time.Second}
 )
 
-var dnsCache = new(sync.Map)
+var errInvalidQuery = errors.New("invalid query message")
+
+const upstreamTimeout = 30 * time.Second
 
 type DNSCacheRR struct {
 	RR     dns.RR
 	Expiry time.Time
 }
 
-func parseFlags() {
-	flag.BoolVar(&httpMode, "http", httpMode, "set http mode")
-	flag.StringVar(&addr, "addr", addr, "set address")
-	flag.StringVar(&udpAddr, "udp", "", "set udp address")
-	flag.StringVar(&certFile, "cert", "", "set cert.pem file")
-	flag.StringVar(&keyFile, "key", "", "set key.pem file")
-	flag.StringVar(&skipListFile, "skiplist", "", "set skip list file")
-	flag.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
-	flag.StringVar(&userAgentFile, "ua", "", "set user agent list file")
-	flag.StringVar(&defaultDNSResolver, "default-resolver", defaultDNSResolver, "set default dns server")
-	flag.BoolVar(&enabledLog, "log", enabledLog, "enable log")
-	flag.Func("proxy", "set proxy servers to query dns using random routes", func(s string) error {
+func parseFlags(args []string) error {
+	flags := flag.NewFlagSet("doh-server", flag.ContinueOnError)
+	flags.BoolVar(&httpMode, "http", httpMode, "set http mode")
+	flags.StringVar(&addr, "addr", addr, "set address")
+	flags.StringVar(&udpAddr, "udp", "", "set udp address")
+	flags.StringVar(&certFile, "cert", "", "set cert.pem file")
+	flags.StringVar(&keyFile, "key", "", "set key.pem file")
+	flags.StringVar(&skipListFile, "skiplist", "", "set skip list file")
+	flags.StringVar(&blocklistFile, "blocklist", "", "set blocklist file")
+	flags.StringVar(&userAgentFile, "ua", "", "set user agent list file")
+	flags.StringVar(&defaultDNSResolver, "default-resolver", defaultDNSResolver, "set default dns server")
+	flags.BoolVar(&enabledLog, "log", enabledLog, "enable log")
+	flags.Func("proxy", "set proxy servers to query dns using random routes", func(s string) error {
 		if noProxyServers {
 			return nil
 		}
@@ -105,7 +110,7 @@ func parseFlags() {
 		}
 		if s == "off" {
 			noProxyServers = true
-			proxyServers = make([]Config, 0)
+			proxyServers = nil
 			return nil
 		}
 
@@ -118,7 +123,7 @@ func parseFlags() {
 
 		return nil
 	})
-	flag.Func("dns", "set doh dns server", func(s string) error {
+	flags.Func("dns", "set doh dns server", func(s string) error {
 		if len(s) == 0 {
 			return errors.New("dns server cannot be empty")
 		}
@@ -148,91 +153,53 @@ func parseFlags() {
 
 		return nil
 	})
-	flag.Parse()
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
+	if len(proxyServers) == 0 {
+		noProxyServers = true
+	}
 	if len(dnsServers) == 0 {
 		dnsServers = defaultDNSServers
 	}
 	slices.SortFunc(dnsServers, func(a, b DNSConfig) int {
-		return a.ID - b.ID
+		return cmp.Compare(a.ID, b.ID)
 	})
-	if len(userAgentFile) == 0 {
-		userAgents.Store(&defaultUserAgent)
-	}
+
+	return nil
 }
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	parseFlags()
+	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		slog.Error("run server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if err := parseFlags(args); err != nil {
+		return err
+	}
 
 	if !httpMode && (len(certFile) == 0 || len(keyFile) == 0) {
-		slog.Error("empty keys file path", "error", "empty keys")
-		os.Exit(1)
-		return
+		return errors.New("empty keys file path")
 	}
 
 	if err := loadConfigs(); err != nil {
-		slog.Error("load configuration file", "error", err)
-		os.Exit(1)
-		return
+		return fmt.Errorf("load configuration file: %w", err)
 	}
 
-	// enable udp server if enabled
-	if len(udpAddr) > 0 {
-		go StartUDPServer()
+	configs, err := newClientConfigs()
+	if err != nil {
+		return err
 	}
-
-	// setup http client
-	proxyLen := len(proxyServers)
-	clientConfigs = make([]ClientConfig, proxyLen)
-	if !noProxyServers {
-		for i, proxyServer := range proxyServers {
-			dial, err := proxy.SOCKS5("tcp", proxyServer.Host, nil, proxy.Direct)
-			if err != nil {
-				slog.Error("connect to proxy server", "error", err)
-				os.Exit(1)
-				return
-			}
-			dialer := dial.(proxy.ContextDialer)
-			dnsConfigs := slices.Clone(dnsServers)
-			if proxyServer.Type == TypeDefault {
-				dnsConfigs = slices.DeleteFunc(dnsConfigs, func(d DNSConfig) bool {
-					return d.Type == TypeTor
-				})
-			}
-			httpTransport := &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return dialer.DialContext(ctx, network, addr)
-				},
-				TLSHandshakeTimeout:   15 * time.Second,
-				ResponseHeaderTimeout: 15 * time.Second,
-				IdleConnTimeout:       90 * time.Second,
-			}
-			http2.ConfigureTransport(httpTransport)
-
-			clientConfigs[i] = ClientConfig{
-				DNSConfigs: dnsConfigs,
-				Client: &http.Client{
-					Transport: httpTransport,
-					Timeout:   30 * time.Second,
-				},
-			}
-		}
-	} else {
-		// remove dns over tor because no proxy
-		dnsServers = slices.DeleteFunc(dnsServers, func(d DNSConfig) bool {
-			return d.Type == TypeTor
-		})
-		httpTransport := http.DefaultTransport.(*http.Transport)
-		http2.ConfigureTransport(httpTransport)
-		clientConfigs = append(clientConfigs, ClientConfig{
-			DNSConfigs: dnsServers,
-			Client: &http.Client{
-				Transport: httpTransport,
-			},
-		})
-	}
+	clientConfigs = configs
 
 	if enabledLog {
 		slog.Info("print user agents", "ua", userAgents.Load())
@@ -241,305 +208,360 @@ func main() {
 		slog.Info("print client configs", "clients", clientConfigs)
 	}
 
-	// wait signal reload config (tailscale style)
-	go reloadConfig()
-
-	// clear dns cache
-	go evictDNSCache()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// start http server
-	go func() {
-		e := echo.New()
-
-		if enabledLog {
-			enableHTTPLog(e)
-		}
-
-		g := e.Group("dns-query")
-		g.POST("", echoPOST)
-		g.GET("", echoGET)
-
-		sc := echo.StartConfig{
-			Address:    addr,
-			HideBanner: true,
-			HidePort:   true,
-		}
-
-		startFn := sc.StartTLS
-		if httpMode {
-			// wrap start tls
-			startFn = func(ctx context.Context, h http.Handler, _, _ any) error {
-				return sc.Start(ctx, h)
-			}
-		}
-		if err := startFn(ctx, e, certFile, keyFile); err != nil {
-			e.Logger.Error("start server", "error", err)
-		}
-	}()
-
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+
+	if len(udpAddr) > 0 {
+		conn, err := listenUDP(udpAddr)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		go serveUDP(conn)
+	}
+
+	go reloadConfig(ctx)
+	go evictDNSCache(ctx)
+
+	return startHTTPServer(ctx)
 }
 
-func reloadConfig() {
+func newClientConfigs() ([]ClientConfig, error) {
+	if noProxyServers {
+		dnsServers = slices.DeleteFunc(dnsServers, isTorDNS)
+		if len(dnsServers) == 0 {
+			return nil, errors.New("no dns servers available without proxy")
+		}
+		dialer := &net.Dialer{Timeout: upstreamTimeout, KeepAlive: 30 * time.Second}
+		return []ClientConfig{{
+			DNSConfigs: dnsServers,
+			Client: newHTTPClient(&http.Transport{
+				Proxy:       http.ProxyFromEnvironment,
+				DialContext: dialer.DialContext,
+			}),
+		}}, nil
+	}
+
+	configs := make([]ClientConfig, 0, len(proxyServers))
+	for _, proxyServer := range proxyServers {
+		dial, err := proxy.SOCKS5("tcp", proxyServer.Host, nil, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("connect to proxy server %q: %w", proxyServer.Host, err)
+		}
+		dialer, ok := dial.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("proxy server %q does not support context dialer", proxyServer.Host)
+		}
+		dnsConfigs := slices.Clone(dnsServers)
+		if proxyServer.Type == TypeDefault {
+			dnsConfigs = slices.DeleteFunc(dnsConfigs, isTorDNS)
+		}
+		if len(dnsConfigs) == 0 {
+			return nil, fmt.Errorf("no dns servers available for proxy server %q", proxyServer.Host)
+		}
+		configs = append(configs, ClientConfig{
+			DNSConfigs: dnsConfigs,
+			Client:     newHTTPClient(&http.Transport{DialContext: dialer.DialContext}),
+		})
+	}
+
+	return configs, nil
+}
+
+func isTorDNS(d DNSConfig) bool {
+	return d.Type == TypeTor
+}
+
+func newHTTPClient(transport *http.Transport) *http.Client {
+	transport.ForceAttemptHTTP2 = true
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ResponseHeaderTimeout = 15 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{
+		Transport: transport,
+		Timeout:   upstreamTimeout,
+	}
+}
+
+func startHTTPServer(ctx context.Context) error {
+	e := echo.New()
+
+	if enabledLog {
+		enableHTTPLog(e)
+	}
+
+	g := e.Group("dns-query")
+	g.POST("", echoPOST)
+	g.GET("", echoGET)
+
+	sc := echo.StartConfig{
+		Address:    addr,
+		HideBanner: true,
+		HidePort:   true,
+	}
+	if httpMode {
+		return sc.Start(ctx, e)
+	}
+	return sc.StartTLS(ctx, e, certFile, keyFile)
+}
+
+func reloadConfig(ctx context.Context) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP)
+	defer signal.Stop(sigs)
 
-	go func() {
-		for range sigs {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigs:
 			slog.Info("reloading configuration files")
 			if err := loadConfigs(); err != nil {
-				slog.Error("reloading configuration files", "err", err)
+				slog.Error("reloading configuration files", "error", err)
 			}
 		}
-	}()
+	}
 }
 
 func loadConfigs() error {
-	// read skip list
-	prevSkipList := skipList.Load()
-	skipListTrie, err := readConfigFile(skipListFile)
+	newSkipList, err := readConfigFile(skipListFile)
 	if err != nil {
 		return fmt.Errorf("read skip list: %w", err)
 	}
-	skipList.Store(&skipListTrie)
-	hasSkipList.Store(!skipList.Load().IsZero())
 
-	// read block list
-	prevBlockList := blockList.Load()
-	blockListTrie, err := readConfigFile(blocklistFile)
+	newBlockList, err := readConfigFile(blocklistFile)
 	if err != nil {
-		// rollback skip list
-		skipList.Store(prevSkipList)
-		hasSkipList.Store(!skipList.Load().IsZero())
-
 		return fmt.Errorf("read blocklist: %w", err)
 	}
-	blockList.Store(&blockListTrie)
-	hasBlocklist.Store(!blockList.Load().IsZero())
 
-	// read user agent (only when a file is specified)
+	newUserAgents := defaultUserAgent
 	if len(userAgentFile) > 0 {
-		fs, err := os.Open(userAgentFile)
+		newUserAgents, err = readUserAgentFile(userAgentFile)
 		if err != nil {
-			// rollback skip list
-			skipList.Store(prevSkipList)
-			hasSkipList.Store(!skipList.Load().IsZero())
-			// rollback block list
-			blockList.Store(prevBlockList)
-			hasBlocklist.Store(!blockList.Load().IsZero())
-
 			return fmt.Errorf("read user agent file: %w", err)
 		}
-		defer fs.Close()
-
-		sc := bufio.NewReader(fs)
-		var newUserAgent []string
-		for {
-			raw, _, err := sc.ReadLine()
-			if err != nil {
-				break
-			}
-			line := string(raw)
-			line = strings.TrimSpace(line)
-			// padding version (1.360. to 1.360.0)
-			if strings.HasSuffix(line, ".") {
-				line += "0"
-			}
-			newUserAgent = append(newUserAgent, line)
-		}
-		if len(newUserAgent) == 0 {
-			// rollback skip list
-			skipList.Store(prevSkipList)
-			hasSkipList.Store(!skipList.Load().IsZero())
-			// rollback block list
-			blockList.Store(prevBlockList)
-			hasBlocklist.Store(!blockList.Load().IsZero())
-
-			return errors.New("read user agent: empty user agents")
-		}
-		userAgents.Store(&newUserAgent)
 	}
+
+	skipList.Store(newSkipList)
+	blockList.Store(newBlockList)
+	userAgents.Store(&newUserAgents)
 
 	return nil
 }
 
-type StartFn = func(context.Context, http.Handler, string, string) error
+func readUserAgentFile(filename string) ([]string, error) {
+	fs, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.Close()
 
-func query(c *echo.Context, rawMsg []byte) error {
-	msg := new(dns.Msg)
-	if err := msg.Unpack(rawMsg); err != nil {
-		return newError(c, msg, err, "invalid query message")
+	var agents []string
+	scanner := bufio.NewScanner(fs)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if len(line) == 0 {
+			continue
+		}
+		if strings.HasSuffix(line, ".") {
+			line += "0"
+		}
+		agents = append(agents, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(agents) == 0 {
+		return nil, errors.New("empty user agents")
 	}
 
+	return agents, nil
+}
+
+func readConfigFile(filename string) (*Trie, error) {
+	trie := NewTrie()
+	if len(filename) == 0 {
+		return trie, nil
+	}
+	fs, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("open %s filename: %w", filename, err)
+	}
+	defer fs.Close()
+
+	scanner := bufio.NewScanner(fs)
+	for scanner.Scan() {
+		line, _, _ := strings.Cut(scanner.Text(), "#")
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		trie.Insert(dns.Fqdn(fields[len(fields)-1]))
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s filename: %w", filename, err)
+	}
+
+	return trie, nil
+}
+
+func resolve(ctx context.Context, rawMsg []byte) ([]byte, error) {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(rawMsg); err != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidQuery, err)
+	}
+	return answer(ctx, msg, rawMsg), nil
+}
+
+func answer(ctx context.Context, msg *dns.Msg, rawMsg []byte) []byte {
 	if enabledLog {
 		slog.Info("query", "q", msg.Question)
 	}
 
-	// allow only type: A, AAAA, CNAME, SRV, TXT
-	if len(msg.Question) != 1 ||
-		(msg.Question[0].Qtype != dns.TypeSRV && msg.Question[0].Qtype != dns.TypeTXT &&
-			msg.Question[0].Qtype != dns.TypeA && msg.Question[0].Qtype != dns.TypeAAAA &&
-			msg.Question[0].Qtype != dns.TypeCNAME) ||
-		(msg.Question[0].Qclass == 0) {
-		newMsg := new(dns.Msg)
-		newMsg.SetReply(msg)
-		respBody, _ := newMsg.Pack()
-		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+	if !isSupportedQuery(msg) {
+		return packResponse(msg, newReply(msg), "unsupported")
 	}
 
-	// skip
-	if hasSkipList.Load() {
-		for _, q := range msg.Question {
-			if skipList.Load().Match(q.Name) {
-				rawBody, err := resolveSkipUDP(c.Request().Context(), rawMsg)
-				if err != nil {
-					return newError(c, msg, err, "skip domain")
-				}
-				if enabledLog {
-					msg := new(dns.Msg)
-					if err := msg.Unpack(rawBody); err == nil {
-						slog.Info("unpack (skiplist)", "q", msg.Question, "a", msg.Answer)
-					}
-				}
-				return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, rawBody)
-			}
-		}
+	if skipList.Load().Match(msg.Question[0].Name) {
+		return resolveSkipped(ctx, msg)
 	}
 
-	// get cache
-	if msg, hit := getCache(msg); hit {
-		respBody, err := msg.Pack()
-		if err != nil {
-			return newError(c, msg, err, "hit cache")
-		}
-		if enabledLog {
-			slog.Info("unpack (hit cache)", "q", msg.Question, "a", msg.Answer)
-		}
-		return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+	if cached, hit := getCache(msg); hit {
+		return packResponse(msg, cached, "cache")
 	}
 
-	// skip if blocklist is empty
-	if hasBlocklist.Load() {
-		if msg, isBlock := answerBlocklist(msg); isBlock {
-			respBody, err := msg.Pack()
-			if err != nil {
-				return newError(c, msg, err, "block domain")
-			}
-			if enabledLog {
-				slog.Info("unpack (blocked)", "q", msg.Question, "a", msg.Answer)
-			}
-			return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
-		}
+	if blocked, isBlocked := answerBlocklist(msg); isBlocked {
+		return packResponse(msg, blocked, "blocklist")
 	}
 
-	// query from upstream servers
-	q := msg.Question[0]
-	key := q.Name + dns.Type(q.Qtype).String()
-	respRawMsg, err := doRequest(c.Request().Context(), key, rawMsg)
+	return resolveUpstream(ctx, msg, rawMsg)
+}
+
+func isSupportedQuery(msg *dns.Msg) bool {
+	return len(msg.Question) == 1 &&
+		msg.Question[0].Qclass != 0 &&
+		slices.Contains(supportedQtypes, msg.Question[0].Qtype)
+}
+
+func resolveSkipped(ctx context.Context, msg *dns.Msg) []byte {
+	respMsg, _, err := skipUDPClient.ExchangeContext(ctx, msg, defaultDNSResolver)
+	if err == nil && respMsg.Truncated {
+		respMsg, _, err = skipTCPClient.ExchangeContext(ctx, msg, defaultDNSResolver)
+	}
 	if err != nil {
-		return newError(c, msg, err, "do request")
+		return serverFailure(msg, err, "skip domain")
+	}
+	return packResponse(msg, respMsg, "skiplist")
+}
+
+func resolveUpstream(ctx context.Context, msg *dns.Msg, rawMsg []byte) []byte {
+	q := msg.Question[0]
+	respRawMsg, err := doRequest(ctx, cacheKey(q), rawMsg)
+	if err != nil {
+		return serverFailure(msg, err, "do request")
 	}
 	respMsg := new(dns.Msg)
 	if err := respMsg.Unpack(respRawMsg); err != nil {
-		return newError(c, msg, err, fmt.Sprintf("parse dns message (%q)", respRawMsg))
+		return serverFailure(msg, err, "parse upstream dns message")
 	}
+	respMsg.Id = msg.Id
+	respMsg.Question = msg.Question
 
-	if len(respMsg.Answer) > 0 {
-		// cache dns RR header
-		key := respMsg.Question[0].Name + dns.Type(respMsg.Question[0].Qtype).String()
-		cacheRR := make([]DNSCacheRR, 0)
-		for _, a := range respMsg.Answer {
-			cacheRR = append(cacheRR, DNSCacheRR{
-				RR:     dns.Copy(a),
-				Expiry: time.Now().Add(time.Duration(a.Header().Ttl) * time.Second),
-			})
-		}
-		dnsCache.Store(key, cacheRR)
-	}
-	respBody, err := respMsg.Pack()
-	if err != nil {
-		return newError(c, msg, err, "pack dns message")
-	}
-	if enabledLog {
-		slog.Info("unpack", "q", respMsg.Question, "a", respMsg.Answer)
-	}
+	storeCache(q, respMsg)
 
-	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
+	return packResponse(msg, respMsg, "upstream")
 }
 
-func resolveSkipUDP(ctx context.Context, rawMsg []byte) ([]byte, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", defaultDNSResolver)
+func packResponse(msg, respMsg *dns.Msg, source string) []byte {
+	respBody, err := respMsg.Pack()
 	if err != nil {
-		return nil, fmt.Errorf("dial udp: %w", err)
+		return serverFailure(msg, err, "pack "+source+" dns message")
 	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	n, err := conn.Write(rawMsg)
-	if err != nil || n == 0 {
-		if n == 0 {
-			err = io.EOF
-		}
-		return nil, fmt.Errorf("write msg udp: %w", err)
+	if enabledLog {
+		slog.Info("answer", "source", source, "q", respMsg.Question, "a", respMsg.Answer)
 	}
+	return respBody
+}
 
-	buf := make([]byte, 4096)
-	n, err = conn.Read(buf)
-	if err != nil || n == 0 {
-		if n == 0 {
-			err = io.EOF
-		}
-		return nil, fmt.Errorf("read msg udp: %w", err)
-	}
-	return buf[:n], nil
+func newReply(msg *dns.Msg) *dns.Msg {
+	reply := new(dns.Msg)
+	reply.SetReply(msg)
+	reply.RecursionAvailable = true
+	return reply
+}
+
+func serverFailure(msg *dns.Msg, err error, message string) []byte {
+	slog.Error(message, "query", msg.Question, "error", err)
+	respMsg := new(dns.Msg)
+	respMsg.SetRcode(msg, dns.RcodeServerFailure)
+	respBody, _ := respMsg.Pack()
+	return respBody
 }
 
 func doRequest(ctx context.Context, key string, rawMsg []byte) ([]byte, error) {
 	result, err, _ := sfGroup.Do(key, func() (any, error) {
-		idx := rand.IntN(len(clientConfigs))
-		dnsConfigs := clientConfigs[idx].DNSConfigs
-		agent := userAgents.Load()
-		userAgent := (*agent)[rand.IntN(len(*agent))]
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamTimeout)
+		defer cancel()
 
-		for _, dnsConfig := range dnsConfigs {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, dnsConfig.Host, bytes.NewReader(rawMsg))
+		clientConfig := clientConfigs[randomIndex(len(clientConfigs))]
+		agents := *userAgents.Load()
+		userAgent := agents[randomIndex(len(agents))]
+
+		var errs []error
+		for _, dnsConfig := range clientConfig.DNSConfigs {
+			respRawMsg, err := fetchUpstream(ctx, clientConfig.Client, dnsConfig.Host, userAgent, rawMsg)
 			if err != nil {
+				errs = append(errs, err)
 				continue
 			}
-			req.ContentLength = int64(len(rawMsg))
-			req.Header.Set(HeaderContentType, MIMEApplicationDNSMessage)
-			req.Header.Set(HeaderAccept, MIMEApplicationDNSMessage)
-			req.Header.Set(HeaderUserAgent, userAgent)
-
-			resp, err := clientConfigs[idx].Client.Do(req)
-			if err != nil {
-				continue
-			}
-			defer resp.Body.Close()
-
-			// parse response body
-			respRawMsg, err := io.ReadAll(resp.Body)
-			if err != nil {
-				continue
-			}
-
 			return respRawMsg, nil
 		}
 
-		return nil, errors.New("all upstream servers failed")
+		return nil, fmt.Errorf("all upstream servers failed: %w", errors.Join(errs...))
 	})
-
 	if err != nil {
 		return nil, err
 	}
 
-	return result.([]byte), nil
+	respRawMsg, ok := result.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("unexpected upstream result type %T", result)
+	}
+	return respRawMsg, nil
+}
+
+func fetchUpstream(ctx context.Context, client *http.Client, host, userAgent string, rawMsg []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host, bytes.NewReader(rawMsg))
+	if err != nil {
+		return nil, fmt.Errorf("new request %s: %w", host, err)
+	}
+	req.Header.Set(HeaderContentType, MIMEApplicationDNSMessage)
+	req.Header.Set(HeaderAccept, MIMEApplicationDNSMessage)
+	req.Header.Set(HeaderUserAgent, userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request %s: %w", host, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request %s: unexpected status %d", host, resp.StatusCode)
+	}
+
+	respRawMsg, err := io.ReadAll(io.LimitReader(resp.Body, dns.MaxMsgSize))
+	if err != nil {
+		return nil, fmt.Errorf("read response %s: %w", host, err)
+	}
+	return respRawMsg, nil
+}
+
+func randomIndex(n int) int {
+	i, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0
+	}
+	return int(i.Int64())
 }
 
 func echoPOST(c *echo.Context) error {
@@ -547,169 +569,122 @@ func echoPOST(c *echo.Context) error {
 		slog.Info("request header", "headers", c.Request().Header)
 	}
 
-	contentType := c.Request().Header.Get(echo.HeaderContentType)
-	if contentType != MIMEApplicationDNSMessage {
-		return newError(c, nil, nil, "query message not found")
+	if c.Request().Header.Get(HeaderContentType) != MIMEApplicationDNSMessage {
+		return c.NoContent(http.StatusUnsupportedMediaType)
 	}
-	rawMsg, err := io.ReadAll(c.Request().Body)
-	if err != nil {
-		return newError(c, nil, nil, "query message not found")
-	}
-	if len(rawMsg) == 0 {
-		return newError(c, nil, nil, "query message not found")
+	rawMsg, err := io.ReadAll(io.LimitReader(c.Request().Body, dns.MaxMsgSize+1))
+	if err != nil || len(rawMsg) == 0 || len(rawMsg) > dns.MaxMsgSize {
+		return c.NoContent(http.StatusBadRequest)
 	}
 
-	return query(c, rawMsg)
+	return writeDNSResponse(c, rawMsg)
 }
 
 func echoGET(c *echo.Context) error {
-	domainName := c.QueryParam("dns")
-	if len(domainName) == 0 {
-		return newError(c, nil, nil, "query message not found")
-	}
-	rawMsg, err := base64.RawStdEncoding.DecodeString(domainName)
-	if err != nil {
-		return newError(c, nil, nil, "query message not found")
-	}
-	if len(rawMsg) == 0 {
-		return newError(c, nil, nil, "query message not found")
+	rawMsg, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(c.QueryParam("dns"), "="))
+	if err != nil || len(rawMsg) == 0 {
+		return c.NoContent(http.StatusBadRequest)
 	}
 
-	return query(c, rawMsg)
+	return writeDNSResponse(c, rawMsg)
 }
 
-func newError(c *echo.Context, msg *dns.Msg, err error, message string) error {
-	var respBody []byte
-	if msg != nil {
-		newMsg := new(dns.Msg)
-		newMsg.SetRcode(msg, dns.RcodeServerFailure)
-		respBody, _ = newMsg.Pack()
-		c.Logger().ErrorContext(
-			c.Request().Context(),
-			message,
-			"query", msg.Question,
-			"error", err,
-		)
+func writeDNSResponse(c *echo.Context, rawMsg []byte) error {
+	respBody, err := resolve(c.Request().Context(), rawMsg)
+	if err != nil {
+		return c.NoContent(http.StatusBadRequest)
 	}
 	return c.Blob(http.StatusOK, MIMEApplicationDNSMessage, respBody)
 }
 
-func evictDNSCache() {
+func evictDNSCache(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
-	cleanFn := func() {
-		dnsCache.Range(func(key any, val any) bool {
-			cacheRR := val.([]DNSCacheRR)
-			for _, rr := range cacheRR {
-				if time.Until(rr.Expiry).Seconds() <= 0 {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dnsCache.Range(func(key, val any) bool {
+				cacheRR, ok := val.([]DNSCacheRR)
+				if !ok || slices.ContainsFunc(cacheRR, isExpired) {
 					dnsCache.Delete(key)
-					break
 				}
-			}
-			return true
-		})
-	}
-
-	for range ticker.C {
-		cleanFn()
+				return true
+			})
+		}
 	}
 }
 
+func isExpired(rr DNSCacheRR) bool {
+	return time.Until(rr.Expiry) <= 0
+}
+
+func cacheKey(q dns.Question) string {
+	return strings.ToLower(q.Name) + dns.Type(q.Qtype).String()
+}
+
+func storeCache(q dns.Question, respMsg *dns.Msg) {
+	if len(respMsg.Answer) == 0 {
+		return
+	}
+	now := time.Now()
+	cacheRR := make([]DNSCacheRR, 0, len(respMsg.Answer))
+	for _, a := range respMsg.Answer {
+		cacheRR = append(cacheRR, DNSCacheRR{
+			RR:     dns.Copy(a),
+			Expiry: now.Add(time.Duration(a.Header().Ttl) * time.Second),
+		})
+	}
+	dnsCache.Store(cacheKey(q), cacheRR)
+}
+
 func getCache(msg *dns.Msg) (*dns.Msg, bool) {
-	newMsg := new(dns.Msg)
-	newMsg.SetReply(msg)
-
-	for _, q := range msg.Question {
-		key := q.Name + dns.Type(q.Qtype).String()
-		val, hit := dnsCache.Load(key)
-		if !hit {
-			return msg, false
-		}
-
-		cacheRR := val.([]DNSCacheRR)
-		for _, rr := range cacheRR {
-			ttl := time.Until(rr.Expiry).Seconds()
-			if ttl <= 0 {
-				return msg, false
-			}
-			rr := dns.Copy(rr.RR)
-			rr.Header().Ttl = uint32(ttl)
-			if rr.Header().Ttl == 0 {
-				rr.Header().Ttl = 1
-			}
-			newMsg.Answer = append(newMsg.Answer, rr)
-		}
+	val, hit := dnsCache.Load(cacheKey(msg.Question[0]))
+	if !hit {
+		return nil, false
+	}
+	cacheRR, ok := val.([]DNSCacheRR)
+	if !ok || len(cacheRR) == 0 {
+		return nil, false
 	}
 
-	if len(newMsg.Answer) == 0 {
-		return msg, false
+	newMsg := newReply(msg)
+	for _, rr := range cacheRR {
+		ttl := time.Until(rr.Expiry)
+		if ttl <= 0 {
+			return nil, false
+		}
+		cached := dns.Copy(rr.RR)
+		cached.Header().Ttl = max(uint32(ttl.Seconds()), 1)
+		newMsg.Answer = append(newMsg.Answer, cached)
 	}
+
 	return newMsg, true
 }
 
 func answerBlocklist(msg *dns.Msg) (*dns.Msg, bool) {
-	for _, q := range msg.Question {
-		if blockList.Load().Match(q.Name) {
-			newMsg := new(dns.Msg)
-			newMsg.SetReply(msg)
-
-			var answer dns.RR = &dns.A{
-				Hdr: dns.RR_Header{
-					Name:   q.Name,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET,
-					Ttl:    300,
-				},
-				A: net.IPv4zero,
-			}
-			if q.Qtype == dns.TypeAAAA {
-				answer = &dns.AAAA{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeAAAA,
-						Class:  dns.ClassINET,
-						Ttl:    300,
-					},
-					AAAA: net.IPv6zero,
-				}
-			}
-			newMsg.Answer = append(newMsg.Answer, answer)
-
-			return newMsg, true
-		}
+	q := msg.Question[0]
+	if !blockList.Load().Match(q.Name) {
+		return nil, false
 	}
 
-	return msg, false
-}
-
-func readConfigFile(filename string) (Trie, error) {
-	trieList := NewTrie()
-	if len(filename) == 0 {
-		return trieList, nil
+	newMsg := newReply(msg)
+	hdr := dns.RR_Header{
+		Name:   q.Name,
+		Rrtype: q.Qtype,
+		Class:  dns.ClassINET,
+		Ttl:    300,
 	}
-	fs, err := os.Open(filename)
-	if err != nil {
-		return trieList, fmt.Errorf("open %s filename: %w", filename, err)
-	}
-	defer fs.Close()
-
-	var line string
-	for {
-		if _, err := fmt.Fscanln(fs, &line); err != nil {
-			break
-		}
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		if !strings.HasSuffix(line, ".") {
-			line += "."
-		}
-		trieList.Insert(line)
+	switch q.Qtype {
+	case dns.TypeA:
+		newMsg.Answer = append(newMsg.Answer, &dns.A{Hdr: hdr, A: net.IPv4zero})
+	case dns.TypeAAAA:
+		newMsg.Answer = append(newMsg.Answer, &dns.AAAA{Hdr: hdr, AAAA: net.IPv6zero})
 	}
 
-	return trieList, nil
+	return newMsg, true
 }
 
 func enableHTTPLog(e *echo.Echo) {
@@ -725,77 +700,85 @@ func enableHTTPLog(e *echo.Echo) {
 		LogContentLength: true,
 		LogResponseSize:  true,
 		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
-			logger := c.Logger()
-			if v.Error == nil {
-				logger.LogAttrs(context.Background(), slog.LevelInfo, "request",
-					slog.String("method", v.Method),
-					slog.String("uri", v.URI),
-					slog.Int("status", v.Status),
-					slog.Duration("latency", v.Latency),
-					slog.String("bytes_in", v.ContentLength),
-					slog.Int64("bytes_out", v.ResponseSize),
-				)
-				return nil
-			}
-
-			logger.LogAttrs(context.Background(), slog.LevelError, "request error",
+			attrs := make([]slog.Attr, 0, 7)
+			attrs = append(attrs,
 				slog.String("method", v.Method),
 				slog.String("uri", v.URI),
 				slog.Int("status", v.Status),
 				slog.Duration("latency", v.Latency),
 				slog.String("bytes_in", v.ContentLength),
 				slog.Int64("bytes_out", v.ResponseSize),
-				slog.String("error", v.Error.Error()),
 			)
+			if v.Error == nil {
+				c.Logger().LogAttrs(c.Request().Context(), slog.LevelInfo, "request", attrs...)
+				return nil
+			}
+
+			attrs = append(attrs, slog.String("error", v.Error.Error()))
+			c.Logger().LogAttrs(c.Request().Context(), slog.LevelError, "request error", attrs...)
 			return nil
 		},
 	}))
 }
 
-func StartUDPServer() {
-	addrPort, err := netip.ParseAddrPort(udpAddr)
+func listenUDP(address string) (*net.UDPConn, error) {
+	addrPort, err := netip.ParseAddrPort(address)
 	if err != nil {
-		slog.Error("parse udp addr port", "error", err)
-		os.Exit(1)
-		return
+		return nil, fmt.Errorf("parse udp addr port: %w", err)
 	}
-
-	addr := net.UDPAddrFromAddrPort(addrPort)
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(addrPort))
 	if err != nil {
-		slog.Error("listen udp server", "error", err)
-		os.Exit(1)
-		return
+		return nil, fmt.Errorf("listen udp server: %w", err)
 	}
-	defer conn.Close()
+	return conn, nil
+}
 
-	buf := make([]byte, 512)
+func serveUDP(conn *net.UDPConn) {
+	buf := make([]byte, dns.MaxMsgSize)
 	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			continue
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		go handleUDP(conn, remoteAddr, data)
+		go handleUDP(conn, remoteAddr, bytes.Clone(buf[:n]))
 	}
 }
 
-func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, rawMsg []byte) {
-	req, _ := http.NewRequest("POST", "/dns-query", bytes.NewReader(rawMsg))
-	req.Header.Set("Content-Type", "application/dns-message")
-	rec := httptest.NewRecorder()
-	c := echo.NewContext(req, rec)
-
-	if err := query(c, rawMsg); err != nil {
-		slog.Error("query", "err", err)
+func handleUDP(conn *net.UDPConn, remoteAddr netip.AddrPort, rawMsg []byte) {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(rawMsg); err != nil {
+		slog.Error("unpack udp query", "error", err)
 		return
 	}
 
-	if _, err := conn.WriteToUDP(rec.Body.Bytes(), addr); err != nil {
-		slog.Error("write udp", "err", err)
-		return
+	respBody := truncateUDP(msg, answer(context.Background(), msg, rawMsg))
+	if _, err := conn.WriteToUDPAddrPort(respBody, remoteAddr); err != nil {
+		slog.Error("write udp", "error", err)
 	}
+}
+
+func truncateUDP(msg *dns.Msg, respBody []byte) []byte {
+	size := dns.MinMsgSize
+	if opt := msg.IsEdns0(); opt != nil {
+		size = max(int(opt.UDPSize()), dns.MinMsgSize)
+	}
+	if len(respBody) <= size {
+		return respBody
+	}
+
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respBody); err != nil {
+		return serverFailure(msg, err, "unpack udp response")
+	}
+	respMsg.Truncate(size)
+	truncated, err := respMsg.Pack()
+	if err != nil {
+		return serverFailure(msg, err, "pack truncated udp response")
+	}
+	return truncated
 }
 
 type Trie struct {
@@ -803,34 +786,33 @@ type Trie struct {
 	matched  bool
 }
 
-func NewTrie() Trie {
-	return Trie{children: map[string]*Trie{}}
-}
-
-func (t *Trie) IsZero() bool {
-	return t == nil || len(t.children) == 0
+func NewTrie() *Trie {
+	return &Trie{children: make(map[string]*Trie)}
 }
 
 func (t *Trie) Insert(domain string) {
-	parts := strings.Split(domain, ".")
 	node := t
-	for i := len(parts) - 1; i >= 0; i-- {
-		if node.children[parts[i]] == nil {
-			node.children[parts[i]] = &Trie{children: map[string]*Trie{}}
+	for _, part := range slices.Backward(strings.Split(strings.ToLower(domain), ".")) {
+		next, ok := node.children[part]
+		if !ok {
+			next = NewTrie()
+			node.children[part] = next
 		}
-		node = node.children[parts[i]]
+		node = next
 	}
 	node.matched = true
 }
 
 func (t *Trie) Match(domain string) bool {
-	parts := strings.Split(domain, ".")
+	if t == nil {
+		return false
+	}
 	node := t
-	for i := len(parts) - 1; i >= 0; i-- {
+	for _, part := range slices.Backward(strings.Split(strings.ToLower(domain), ".")) {
 		if node.matched {
 			return true
 		}
-		next, ok := node.children[parts[i]]
+		next, ok := node.children[part]
 		if !ok {
 			return false
 		}
